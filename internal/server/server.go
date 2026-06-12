@@ -55,31 +55,58 @@ type Server struct {
 	// 往本机塞文件, 上传仅在接收模式开启时可用.
 	receiveMode atomic.Bool
 
+	port       int    // HTTP 端口, 默认 8443; QUICKDROP_PORT env 可覆盖 (测试用)
 	homeURL    string // 电脑端发送 dashboard URL
 	receiveURL string // 电脑端接收 dashboard URL
 	mobileURL  string // 手机端发送目标 URL (QR 编码 + 托盘 "复制扫码链接" 复制)
 	uploadURL  string // 手机端上传 URL (接收模式 QR 编码)
-	baseURL    string // http://<lan>:8443
+	baseURL    string // http://<lan>:<port>
 	httpSrv    *http.Server
 
 	// dist 是 Vite 构建产物的 fs (含 index.html / d.html / r.html / u.html / assets/*).
 	// 由 cmd/quickdrop 通过 SetDist 注入 (因为 //go:embed 必须在 main 包里相对仓库根).
 	dist fs.FS
 
+	// peerSource 提供局域网内发现的 PC 列表 (来自 internal/discovery).
+	// nil 时 /api/peers 返回空数组. 由 SetPeerSource 注入.
+	peerSource PeerSource
+
 	onSwap    func(newName string) // 文件被 SwapFile 切换后回调 (tray tooltip 用)
 	onReceive func(on bool)        // 接收模式切换后回调 (main 起/关 receive webview)
 }
 
+// PeerSource 注入接口, server 通过它拉发现到的对端列表 (避免 server 直接依赖 discovery 包).
+type PeerSource interface {
+	Peers() []*Peer
+}
+
+// Peer 与 internal/discovery.Peer 字段同名同义, 为了 server → JSON 转换不引入循环依赖,
+// 这里独立定义一份. JSON 字段保持小写驼峰与前端一致.
+type Peer struct {
+	UUID    string   `json:"uuid"`
+	Name    string   `json:"name"`
+	Host    string   `json:"host"`
+	IPv4    []string `json:"ipv4"`
+	Port    int      `json:"port"`
+	Version string   `json:"version"`
+	SeenAt  int64    `json:"seenAt"`
+}
+
 // New 装配 Server. rawPath 为空表示纯接收模式启动 (daemon 启动时无文件可发).
+// port 通常是 8443; 为支持多 daemon 同机测试可用 QUICKDROP_PORT env 覆盖.
 // 不启动 listener.
-func New(rawPath string) (*Server, error) {
+func New(rawPath string, port int) (*Server, error) {
+	if port <= 0 {
+		port = 8443
+	}
 	lanIP := getLANIP()
 	if lanIP == "" {
 		return nil, fmt.Errorf("没找到对外 LAN IP, 检查网卡和路由")
 	}
 
-	baseURL := fmt.Sprintf("http://%s:8443", lanIP)
+	baseURL := fmt.Sprintf("http://%s:%d", lanIP, port)
 	s := &Server{
+		port:       port,
 		homeURL:    baseURL + "/",
 		receiveURL: baseURL + "/r",
 		mobileURL:  baseURL + "/d",
@@ -156,6 +183,12 @@ func (s *Server) SetDist(dist fs.FS) {
 	s.dist = dist
 }
 
+// SetPeerSource 注入对端发现源 (来自 internal/discovery).
+// 必须在 Start 之前调用. 不调用时 /api/peers 返回空数组.
+func (s *Server) SetPeerSource(src PeerSource) {
+	s.peerSource = src
+}
+
 // SwapFile 把当前发送文件切换成 rawPath. 并发安全.
 // 用于 IPC: 第二次 quickdrop send Y 不重启进程, 直接更新这里.
 func (s *Server) SwapFile(rawPath string) error {
@@ -196,6 +229,7 @@ func (s *Server) Start() {
 	mux.HandleFunc("/upload", s.handleUpload)
 	// JSON API (Vue 前端拉服务状态)
 	mux.HandleFunc("/api/info", s.handleAPIInfo)
+	mux.HandleFunc("/api/peers", s.handleAPIPeers)
 	// IPC (仅 127.0.0.1)
 	mux.HandleFunc("/internal/health", requireLocal(s.handleInternalHealth))
 	mux.HandleFunc("/internal/send", requireLocal(s.handleInternalSend))
@@ -203,7 +237,7 @@ func (s *Server) Start() {
 	// 静态资源 (Vue chunks / CSS)
 	mux.Handle("/assets/", http.FileServer(http.FS(s.dist)))
 
-	s.httpSrv = &http.Server{Addr: ":8443", Handler: mux}
+	s.httpSrv = &http.Server{Addr: fmt.Sprintf(":%d", s.port), Handler: mux}
 
 	if s.absPath != "" {
 		log.Printf("发送文件: %s (%s)", s.absPath, s.fileSize)
@@ -213,7 +247,7 @@ func (s *Server) Start() {
 	} else {
 		log.Print("未指定文件, 仅启 daemon (可通过托盘/CLI 进入接收模式或后续 send)")
 	}
-	log.Printf("监听:     0.0.0.0:8443")
+	log.Printf("监听:     0.0.0.0:%d", s.port)
 
 	go func() {
 		if err := s.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -357,6 +391,18 @@ func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(info)
+}
+
+// handleAPIPeers /api/peers : Vue 前端 + 托盘 "发送到..." 菜单拉局域网 PC 列表.
+// 没有 peerSource 时返回 [] 而不是 null, 前端可以无脑 .map().
+func (s *Server) handleAPIPeers(w http.ResponseWriter, r *http.Request) {
+	peers := []*Peer{}
+	if s.peerSource != nil {
+		peers = s.peerSource.Peers()
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(peers)
 }
 
 // handleInternalHealth: GET /internal/health

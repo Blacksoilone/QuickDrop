@@ -28,9 +28,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"quickdrop/internal/discovery"
+	"quickdrop/internal/identity"
 	"quickdrop/internal/installer"
 	"quickdrop/internal/server"
 	"quickdrop/internal/tray"
@@ -56,14 +59,27 @@ func init() {
 }
 
 const (
-	daemonURL = "http://127.0.0.1:8443"
-
-	// envWindowMode: 控制 daemon 弹发送 webview 窗口的策略.
+	// envWindowMode: 控制 daemon 弹 webview 窗口的策略.
 	//   replace    (默认): 切换文件时先杀旧窗再开新窗, 屏幕上始终 1 个窗
 	//   keep       : 切换文件时旧窗保留, 屏幕上可能并存多个窗
 	//   first-only : 只在 daemon 首次启动时弹窗, 切换文件不开新窗
 	envWindowMode = "QUICKDROP_WINDOW_MODE"
+
+	// envPort: 覆盖 daemon HTTP 端口 (默认 8443).
+	// 主要用于同机起多个 daemon 做 PC→PC 联调测试 (test-discovery.ps1).
+	// probeDaemon / notifyDaemon 都用同一端口, 这样 "QUICKDROP_PORT=8444 quickdrop send X"
+	// 只跟 8444 上的 daemon 对话, 不影响 8443.
+	envPort = "QUICKDROP_PORT"
+
+	// version 软件版本, 写入 mDNS TXT 给对端做兼容性判断.
+	version = "0.8.0"
 )
+
+// daemonURL 返回客户端模式要 POST 给本机 daemon 的 base URL.
+// 用 envPort, 这样多端口测试时各自找各自的 daemon.
+func daemonURL() string {
+	return fmt.Sprintf("http://127.0.0.1:%d", portFromEnv())
+}
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `QuickDrop - 局域网快速发送/接收
@@ -251,10 +267,10 @@ func runStatus(quiet bool) {
 	log.Print(b.String())
 }
 
-// probeDaemon GET /internal/health, 判断本机 8443 是不是 QuickDrop daemon.
+// probeDaemon GET /internal/health, 判断本机指定端口是不是 QuickDrop daemon.
 func probeDaemon() bool {
 	client := &http.Client{Timeout: 500 * time.Millisecond}
-	resp, err := client.Get(daemonURL + "/internal/health")
+	resp, err := client.Get(daemonURL() + "/internal/health")
 	if err != nil {
 		return false
 	}
@@ -277,7 +293,7 @@ func notifyDaemonReceive(cmd string) error {
 
 func postInternal(path, body string) error {
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Post(daemonURL+path, "text/plain", strings.NewReader(body))
+	resp, err := client.Post(daemonURL()+path, "text/plain", strings.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -293,11 +309,28 @@ func postInternal(path, body string) error {
 // initialPath 为空表示纯接收模式启动 (此时 initialReceive 必须 true, 否则 daemon 啥也不干).
 // initialReceive 表示 daemon 启动后立刻开启接收模式 + 弹接收窗.
 func runDaemon(initialPath string, initialReceive bool) {
-	srv, err := server.New(initialPath)
+	port := portFromEnv()
+
+	// 加载/生成本机身份 (UUID + 显示名)
+	ident, err := identity.Load()
+	if err != nil {
+		log.Fatalf("加载 identity: %v", err)
+	}
+	log.Printf("身份: %s (%s)", ident.Name, ident.UUID[:8])
+
+	srv, err := server.New(initialPath, port)
 	if err != nil {
 		log.Fatal(err)
 	}
 	srv.SetDist(distFS)
+
+	// mDNS: 广播自己 + 发现局域网内其他 QuickDrop. 失败不致命.
+	disc, err := discovery.Start(ident.UUID, ident.Name, version, port)
+	if err != nil {
+		log.Printf("mDNS 启动失败 (PC→PC 发现不可用, 但其他功能正常): %v", err)
+	} else {
+		srv.SetPeerSource(peerAdapter{disc})
+	}
 
 	selfExe, err := os.Executable()
 	if err != nil {
@@ -339,9 +372,46 @@ func runDaemon(initialPath string, initialReceive bool) {
 	}
 
 	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, func() {
+		if disc != nil {
+			disc.Close()
+		}
 		winMgr.Shutdown()
 		srv.Shutdown()
 	})
+}
+
+// portFromEnv 读 QUICKDROP_PORT, 解析失败/空回 8443. 测试支持同机多 daemon.
+func portFromEnv() int {
+	if v := strings.TrimSpace(os.Getenv(envPort)); v != "" {
+		n, err := strconv.Atoi(v)
+		if err == nil && n > 0 && n < 65536 {
+			return n
+		}
+		log.Printf("无效的 %s=%q, 用默认 8443", envPort, v)
+	}
+	return 8443
+}
+
+// peerAdapter 把 internal/discovery.Discovery 适配成 server.PeerSource.
+// 拆这层是因为 server 包不能直接 import discovery (避免循环依赖), 也避免
+// server 包知道 zeroconf 的存在.
+type peerAdapter struct{ d *discovery.Discovery }
+
+func (a peerAdapter) Peers() []*server.Peer {
+	src := a.d.Peers()
+	out := make([]*server.Peer, len(src))
+	for i, p := range src {
+		out[i] = &server.Peer{
+			UUID:    p.UUID,
+			Name:    p.Name,
+			Host:    p.Host,
+			IPv4:    p.IPv4,
+			Port:    p.Port,
+			Version: p.Version,
+			SeenAt:  p.SeenAt,
+		}
+	}
+	return out
 }
 
 func setupLogging() {

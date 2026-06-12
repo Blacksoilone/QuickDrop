@@ -114,6 +114,14 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
   - 删除旧 internal/server/templates.go (268 行) 与所有 fmt.Fprintf HTML 拼接逻辑
   - 5 个回归测试脚本全 PASS (test-routes 改测 Vue 骨架 + /api/info; test-daemon-switch 改测 /api/info)
   - **开发体验飞跃**: `cd web && npm run dev` 起 5173, /api+/qr+/file+/upload 自动 proxy 到 8443 daemon, 热重载
+- [x] **任务 2.5a mDNS 广播 + 发现** (ADR-19, ADR-20):
+  - 新包 `internal/identity`: 持久化 UUID (~/.quickdrop/device-id) + 显示名 (env QUICKDROP_DEVICE_NAME / 主机名)
+  - 新包 `internal/discovery`: 基于 grandcat/zeroconf, 服务名 `_quickdrop._tcp.local`, TXT 含 name/uuid/version
+  - daemon 启动注册 + Browse, 退出注销; 过滤自身 UUID (自己看不到自己)
+  - server 新增 /api/peers JSON 路由 (PeerSource 接口注入避免循环依赖)
+  - QUICKDROP_PORT env 覆盖默认 8443 (probeDaemon 同步使用同一端口, 支持同机多 daemon 测试)
+  - test-discovery.ps1 13 checks ALL PASS (mDNS 广播注册 / UUID 持久化跨重启 / 端口隔离 / 过滤自身)
+  - **限制**: grandcat/zeroconf v1.0 默认不走 loopback (PR #68 待合), 同机两 daemon 互不可见; 真实 PC→PC 测试需要第二台 Windows PC
 
 ## 4. 遇到的问题
 
@@ -130,11 +138,10 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
 
 ## 5. 待办
 
-### 下一步 — 2.5 mDNS 发现 + PC→PC 互传 (ADR-19, ADR-20)
+### 下一步 — 继续推 2.5b–e (PC→PC 互传剩余部分)
 
-按 [QuickDrop.md §6 Phase 2.5](./QuickDrop.md) 拆 5 个递进子步骤,每个独立可 commit:
+按 [QuickDrop.md §6 Phase 2.5](./QuickDrop.md):
 
-- **2.5a** mDNS 广播 + 发现: 起 `_quickdrop._tcp.local` 服务, 托盘菜单/Vue 页面看局域网内 PC 列表
 - **2.5b** PC→PC IPC: `/peer/incoming` 接收元数据 + pending queue + `/peer/file?id=xxx` 鉴权下载
 - **2.5c** Toast 通知 (ADR-19): `go-toast` 弹按钮 toast, install 注册 `quickdrop://` URL scheme
 - **2.5d** `quickdrop accept --id` / `reject --id` 子命令: URL 触发 → Pull 文件
