@@ -8,7 +8,8 @@ import (
 
 // runWebview: 子进程实际起 webview 的内部实现. main goroutine 阻塞调用.
 //
-// 极简策略 (ADR-17): 固定尺寸, 不允许用户拉伸. 标题用空字符串保持最简.
+// 极简策略 (ADR-17): 默认固定尺寸 264×316, 不允许用户拉伸 (mini dashboard 用).
+// 大窗 (config 等) 用 width/height >= 600 时, 改用 HintNone 让用户可拉伸.
 // width/height 0 用默认 264×316 (恰好容下 240px QR + 文件名 + 大小, 无滚动条).
 //
 // 真"无边框"需要原生 WIN32 API 去掉 WS_CAPTION, webview_go 不直接暴露,
@@ -39,7 +40,12 @@ func runWebview(url, title string, width, height int) {
 	}
 
 	w.SetTitle(title)
-	w.SetSize(width, height, webview.HintFixed) // 不让用户改大小
+	// 大窗 (>= 600 宽) 用 HintNone 让用户拉伸; 小窗保持 HintFixed 防破布局
+	var hint webview.Hint = webview.HintFixed
+	if width >= 600 {
+		hint = webview.HintNone
+	}
+	w.SetSize(width, height, hint)
 	w.Navigate(url)
 	w.Run() // 阻塞主消息循环
 }

@@ -33,6 +33,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -124,14 +125,26 @@ func usage() {
 func main() {
 	// window 子命令是 daemon fork 出来的内部入口. 不走 flag.Parse,
 	// 因为 webview 不能被 flag 干扰. 必须最先判断.
+	// 用法:
+	//   quickdrop window <url>                  默认 264x316 (mini dashboard)
+	//   quickdrop window <url> <width> <height> 自定义尺寸 (config / devices 大窗)
 	if len(os.Args) >= 2 && os.Args[1] == "window" {
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: quickdrop window <url>")
+			fmt.Fprintln(os.Stderr, "usage: quickdrop window <url> [width height]")
 			os.Exit(1)
 		}
 		setupLogging()
-		log.Printf("--- window 子进程 pid=%d, url=%s ---", os.Getpid(), os.Args[2])
-		window.Run(os.Args[2], "QuickDrop", 0, 0)
+		w, h := 0, 0
+		if len(os.Args) >= 5 {
+			if n, err := strconv.Atoi(os.Args[3]); err == nil {
+				w = n
+			}
+			if n, err := strconv.Atoi(os.Args[4]); err == nil {
+				h = n
+			}
+		}
+		log.Printf("--- window 子进程 pid=%d, url=%s, size=%dx%d ---", os.Getpid(), os.Args[2], w, h)
+		window.Run(os.Args[2], "QuickDrop", w, h)
 		return
 	}
 
@@ -551,7 +564,14 @@ func runDaemon(initialPath string, initialReceive bool) {
 		winMgr.OpenDevicesWindow(devicesURL)
 	}
 
-	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, onTrayPending, onTrayDevices, func() {
+	// 托盘 "设置" 菜单点击 → 起配置中心子窗 (单实例, 960×640).
+	// 配置页里包含设备管理 section, 所以这是设备管理的主入口; /v 保留兼容.
+	configURL := srv.HomeURL()[:len(srv.HomeURL())-1] + "/c" // baseURL/c
+	onTrayConfig := func() {
+		winMgr.OpenConfigWindow(configURL)
+	}
+
+	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, onTrayPending, onTrayDevices, onTrayConfig, func() {
 		if disc != nil {
 			disc.Close()
 		}

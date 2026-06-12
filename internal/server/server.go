@@ -453,6 +453,7 @@ func (s *Server) Start() {
 	// Peer 待处理列表 dashboard (Vue), 不受 receiveMode 门禁 (PC→PC 走另一套路)
 	mux.HandleFunc("/p", s.handlePendingDashboard)
 	mux.HandleFunc("/v", s.handleDevicesDashboard)
+	mux.HandleFunc("/c", s.handleConfigDashboard)
 	// JSON API (Vue 前端拉服务状态)
 	mux.HandleFunc("/api/info", s.handleAPIInfo)
 	mux.HandleFunc("/api/peers", s.handleAPIPeers)
@@ -604,8 +605,17 @@ func (s *Server) handlePendingDashboard(w http.ResponseWriter, r *http.Request) 
 
 // handleDevicesDashboard /v : 设备管理页 (Vue). 列出所有已知设备,
 // 用户可设/撤 trust/block (ADR-20). 始终可达.
+//
+// v0.11.0 起设备管理已合并进 /c 配置中心. /v 保留向后兼容: 还能用,
+// 但内置一条提示让用户改去 /c#devices. 后续版本会重定向 / 删除.
 func (s *Server) handleDevicesDashboard(w http.ResponseWriter, r *http.Request) {
 	s.serveDistFile(w, r, "v.html")
+}
+
+// handleConfigDashboard /c : 配置中心页 (Vue). 包含所有可调项 + 设备管理.
+// 给 webview 子窗用, 也支持浏览器直接访问 (127.0.0.1:port/c).
+func (s *Server) handleConfigDashboard(w http.ResponseWriter, r *http.Request) {
+	s.serveDistFile(w, r, "c.html")
 }
 
 // serveDistFile 从嵌入的 web/dist 读取文件, 加 no-store 防手机缓存看到旧文件名.

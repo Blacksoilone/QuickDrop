@@ -185,3 +185,51 @@ export function closeWindow(): void {
     window.close();
   }
 }
+
+// ============================================================
+// 配置中心 (/c) - 与 server.go ConfigStore + internal/config.Config 对齐.
+// 字段命名严格用 snake_case, 跟磁盘 JSON 一致, 直接序列化保存.
+// ============================================================
+
+export type ConflictPolicy = "rename" | "overwrite" | "reject";
+
+export interface AppConfig {
+  download: {
+    dir: string; // 空串 = 默认 ~/Downloads/QuickDrop/
+    conflict: ConflictPolicy;
+  };
+  server: {
+    port: number;
+    mdns_enabled: boolean;
+  };
+  receive: {
+    max_file_size: number; // 字节, 0 = 不限
+  };
+  ui: {
+    toasts_enabled: boolean;
+    reveal_on_done: boolean;
+  };
+  system: {
+    autostart: boolean;
+  };
+}
+
+export async function fetchConfig(): Promise<AppConfig> {
+  const r = await fetch("/api/config", { cache: "no-store" });
+  if (!r.ok) throw new Error(`/api/config ${r.status}`);
+  return r.json();
+}
+
+// 整 cfg 提交给 daemon, daemon 内部 Save() 校验 + 持久化 + 热应用.
+// 失败 (非法 port 等) 返 400 + 错误文本.
+export async function saveConfig(cfg: AppConfig): Promise<void> {
+  const r = await fetch("/internal/config-save", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(cfg),
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`config-save ${r.status}: ${txt}`);
+  }
+}

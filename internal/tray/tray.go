@@ -44,9 +44,11 @@ var (
 // onReceive:   用户点 "接收文件" / "停止接收" 时调 (传入新状态 on/off).
 // onPending:   用户点 "待处理 (N)" 时调 (main 起 pending webview 子窗加载 /p).
 // onDevices:   用户点 "设备管理" 时调 (main 起 devices webview 子窗加载 /v).
+//              v0.11.0+ 已合并到 /c#devices, 这个回调暂时保留: 让 main 决定是不是用 onConfig 替代.
+// onConfig:    用户点 "设置" 时调 (main 起 config webview 子窗加载 /c).
 // onExit:      用户点退出时调用 (典型用法: server.Shutdown()).
 //              onExit 在 systray.Quit() 之后, 进程返回前执行.
-func Run(shareURL, initialName string, onReceive func(on bool), onPending func(), onDevices func(), onExit func()) {
+func Run(shareURL, initialName string, onReceive func(on bool), onPending func(), onDevices func(), onConfig func(), onExit func()) {
 	onReady := func() {
 		systray.SetIcon(iconNormalBytes)
 		systray.SetTitle("QuickDrop")
@@ -60,6 +62,7 @@ func Run(shareURL, initialName string, onReceive func(on bool), onPending func()
 		mPend := systray.AddMenuItem("待处理 (0)", "查看待接受/拒绝的文件传入")
 		mPend.Hide() // 默认隐藏, 有 pending 时显示
 		mDev := systray.AddMenuItem("设备管理", "查看已知设备 + 设/撤 信任/黑名单")
+		mCfg := systray.AddMenuItem("设置", "打开配置中心 + 设备管理")
 
 		stateMu.Lock()
 		receiveItem = mRecv
@@ -97,6 +100,10 @@ func Run(shareURL, initialName string, onReceive func(on bool), onPending func()
 				case <-mDev.ClickedCh:
 					if onDevices != nil {
 						onDevices()
+					}
+				case <-mCfg.ClickedCh:
+					if onConfig != nil {
+						onConfig()
 					}
 				case <-mQuit.ClickedCh:
 					systray.Quit()

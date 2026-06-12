@@ -7,6 +7,7 @@ package window
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -54,6 +55,7 @@ type Manager struct {
 	recvCmd   *exec.Cmd   // 接收窗子进程 (独立于 mode, 单实例)
 	pendCmd   *exec.Cmd   // pending dashboard 子进程 (单实例; 用户从托盘点开)
 	devCmd    *exec.Cmd   // devices dashboard 子进程 (单实例; 用户从托盘 "设备管理" 点开)
+	cfgCmd    *exec.Cmd   // 配置中心子进程 (单实例; 用户从托盘 "设置" 点开)
 }
 
 // NewManager 创建一个 Manager. mode 决定 OpenForFile 的行为.
@@ -128,6 +130,9 @@ func (m *Manager) Shutdown() {
 	if m.devCmd != nil && m.devCmd.Process != nil {
 		_ = m.devCmd.Process.Kill()
 	}
+	if m.cfgCmd != nil && m.cfgCmd.Process != nil {
+		_ = m.cfgCmd.Process.Kill()
+	}
 }
 
 // OpenPendingWindow 起一个 pending dashboard 子进程 (单实例).
@@ -166,6 +171,24 @@ func (m *Manager) OpenDevicesWindow(url string) {
 	m.devCmd = cmd
 }
 
+// OpenConfigWindow 起一个配置中心子进程 (单实例, 960×640 大窗).
+// 用户从托盘点 "设置" 时调. 跟其他子窗不同, 这个窗允许用户拉伸.
+func (m *Manager) OpenConfigWindow(url string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cfgCmd != nil && m.cfgCmd.Process != nil {
+		if err := m.cfgCmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			log.Printf("杀旧 config 窗 (PID %d) 失败: %v", m.cfgCmd.Process.Pid, err)
+		}
+	}
+	cmd, err := spawnSized(m.selfExe, url, 960, 640)
+	if err != nil {
+		log.Printf("打开 config webview 子进程失败: %v", err)
+		return
+	}
+	m.cfgCmd = cmd
+}
+
 // OpenReceiveWindow 起一个接收 dashboard 子进程. 单实例.
 // 若已存在 (用户连续多次点"接收文件"), 先杀旧的.
 func (m *Manager) OpenReceiveWindow(url string) {
@@ -200,11 +223,21 @@ func (m *Manager) CloseReceiveWindow() {
 // spawn fork 一个 `<selfExe> window <url>` 子进程, 立刻返回不等它结束.
 // 子进程退出由 OS 回收, 父进程不 Wait (Wait 会阻塞)... reaper goroutine 兜底.
 func spawn(selfExe, url string) (*exec.Cmd, error) {
-	cmd := exec.Command(selfExe, "window", url)
+	return spawnSized(selfExe, url, 0, 0)
+}
+
+// spawnSized fork `<selfExe> window <url> <width> <height>` 子进程.
+// width/height = 0 时子进程内用默认 264×316.
+func spawnSized(selfExe, url string, width, height int) (*exec.Cmd, error) {
+	args := []string{"window", url}
+	if width > 0 || height > 0 {
+		args = append(args, fmt.Sprintf("%d", width), fmt.Sprintf("%d", height))
+	}
+	cmd := exec.Command(selfExe, args...)
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	log.Printf("打开 webview 子进程 PID %d 加载 %s", cmd.Process.Pid, url)
+	log.Printf("打开 webview 子进程 PID %d 加载 %s (size=%dx%d)", cmd.Process.Pid, url, width, height)
 	// reaper: 等子进程退出, 防止僵尸 + 记录退出时间, 不阻塞 OpenForFile
 	go func() {
 		if err := cmd.Wait(); err != nil {
