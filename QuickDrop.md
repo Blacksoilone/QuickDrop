@@ -136,3 +136,5 @@ Windows 上没有的 AirDrop —— 右键文件即发送,扫码即接收,局域
 | 12 | Phase 2 自有窗口方案: **WebView2 (Windows 自带)** + 复用 `/qr` 路由 | Windows 10+ 系统自带 Edge WebView2,不需打包浏览器二进制。`github.com/webview/webview_go` 几行代码起无地址栏小窗 |
 | 13 | **推翻 1.3 "终端打印 QR"**,改为网页渲染 `/qr` PNG + 主页内嵌 `<img>` | 终端 QR 与最终形态(WebView2 显示同一张 PNG)路径相反,是死胡同。网页 QR 直接复用同一资源 |
 | 14 | **电脑端 / 手机端 UI 分化**: 一个 QR 对应一个动作 | 电脑是决定者、手机是被动客户端。用 URL 路径区分用途比 UA 嗅探稳,方便 Phase 3 PWA。**部分推翻 ADR-13** 的"一份页面服务两端",ADR-13 在 Phase 1 仍成立,Phase 2 实现 2.11 时按本条拆分 |
+| 15 | **WebView2 跑独立子进程**, 不和 systray 同进程 | systray 和 webview 都要求独占 main goroutine 跑 Windows 消息循环, 同进程会抢消息(webview issue #650, systray #195)。daemon fork `quickdrop window <url>` 子进程跑 webview, 用户关窗 → 子进程退出 → daemon 不受影响。天然契合"分享完即关"的体验, 且跨平台不打架 |
+| 16 | **window-mode 三种策略 (replace/keep/first-only)** 由 env `QUICKDROP_WINDOW_MODE` 配置 | 一次 send 一个文件给一个人 → replace (默认, 屏幕始终 1 窗); 多文件多人 → keep (屏幕保留所有 QR 窗); 嫌烦 → first-only (只首次开窗)。Phase 2 后期配置页 UI 实装时把 env 移过去 |

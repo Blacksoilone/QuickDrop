@@ -22,18 +22,24 @@
 ## 2. 项目结构
 
 ```
-cmd/quickdrop/main.go         入口,probeDaemon → 客户端模式 IPC / daemon 模式起服务
-internal/server/server.go     HTTP server (Start/Shutdown/SwapFile), 路由含 /internal/{health,send}
+cmd/quickdrop/main.go         入口,window 子命令 + probeDaemon → client/daemon
+internal/server/server.go     HTTP server (Start/Shutdown/SwapFile), /internal/{health,send}
 internal/server/templates.go  HTML 模板
 internal/qr/qr.go             QR PNG 渲染
 internal/tray/tray.go         systray, 菜单(复制链接/退出), UpdateTooltip
 internal/tray/icon.ico        托盘图标 16x16 (Windows systray 必须 ICO,不能 PNG)
+internal/window/window.go     webview 子进程实际渲染函数 (runWebview)
+internal/window/manager.go    daemon 持有的子进程管理器 + Mode (replace/keep/first-only)
 build.ps1                     一键构建脚本
 test/prepare-fixtures.ps1     生成 500MB big.bin + 你好世界.png 验收固件
 test/test-crash-cleanup.ps1   验收用例 5 自动化 (中途崩溃 → 重启清理)
-test/test-daemon-switch.ps1   Phase 2.2+2.3 验收: daemon 健康检查 / 客户端 IPC 切换 / requireLocal
+test/test-daemon-switch.ps1   Phase 2.2+2.3 验收: daemon 健康检查 / 客户端 IPC 切换
+test/test-window.ps1          Phase 2.10 验收: webview 子进程 + 三种 window-mode
 TEST.md                       Phase 1 验收清单 (手动 + 自动)
 ```
+
+**环境变量**:
+- `QUICKDROP_WINDOW_MODE=replace|keep|first-only` 控制 daemon 弹窗策略,默认 replace
 
 ## 3. 已完成
 
@@ -46,8 +52,9 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 - [x] **任务 1.5** 命令行:`flag` 包,支持 `send <path>` 显式语法 + 拖拽单参数
 - [x] **任务 1.6** `/upload`:`MultipartReader` 流式 + 临时文件 + rename,中文文件名 RFC 5987 编码
 - [x] **任务 1.7 验收**:用例 1-5 全部 ✅,用例 6(多手机并发)缺设备暂缓。Phase 1 实质完成
-- [x] **任务 2.1** 拆包:`cmd/quickdrop` + `internal/{server,qr,tray}`(见 §2)
+- [x] **任务 2.1** 拆包:`cmd/quickdrop` + `internal/{server,qr,tray,window}`(见 §2)
 - [x] **任务 2.2 + 2.3** Daemon + IPC:第二次 `quickdrop send Y` 不重启进程,POST `/internal/send` 让运行中的 daemon 切换文件。`/internal/*` 由 `requireLocal` 限制只 127.0.0.1 可访问,LAN 一律 404。tooltip 自动跟随当前文件。`test-daemon-switch.ps1` 自动 PASS
+- [x] **任务 2.10** WebView2 小窗:daemon fork `quickdrop window <url>` 子进程,WebView2 280×320 固定大小加载主页 QR。删除"自动开浏览器"(ADR-11 真正落地)。子进程独立 main goroutine 避开 systray/webview 消息循环冲突。三种 window-mode(replace/keep/first-only)由 `QUICKDROP_WINDOW_MODE` env 控制,`test-window.ps1` 自动 PASS
 
 ## 4. 遇到的问题
 
@@ -60,16 +67,18 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 - **崩溃留 `.tmp` 残留**:`taskkill /F` 跳过 saveStream 的 defer 清理 → 半截 tmp 留在 Downloads/QuickDrop。解决:server.Start 启动时 `cleanupStaleTmp()` 清扫上次残留
 - **PowerShell 5.1 读 UTF-8 ps1 报中文乱码**:必须存为 UTF-8 **with BOM**,无 BOM 会被当 GBK 解析炸 parser。已固化
 - **旧版 daemon 占着 8443 时新版起不来**:probeDaemon 只认 `X-QuickDrop:1` header,旧版没此 header → 判定"不是 daemon"→ 走 daemon 模式 → bind fail。**升级场景需要先 kill 旧版**。后续可考虑 daemon 模式 bind fail 时给用户友好提示
+- **systray + webview 不能同进程**:两者都要 main goroutine 跑 Windows 消息循环,放一起会抢消息/调试地狱(见 webview issue #650, systray issue #195)。**方案**:webview 单独 fork 子进程,daemon 进程持 PID 管理生命周期(replace/keep/first-only 三策略)
 
 ## 5. 待办
 
-### 下一步 — 2.10 WebView2 小窗 (推荐)
+### 下一步 — 2.11 UI 分化 (推荐)
 
-发送方电脑端目前**没有 UI** (删了自动开浏览器后)。用户得自己记 URL 或扫自己屏幕背面的 QR。
-做法见 [QuickDrop.md §6 Phase 2 2.10](./QuickDrop.md):
-- `github.com/webview/webview_go` 起 280×320 无边框小窗加载 `http://localhost:8443/qr`
-- 窗口顶部小字 "扫码或选择设备" + QR
-- 点 QR 之外区域 → 关窗 (但 daemon 仍在跑)
+电脑端 daemon 现在弹 webview 加载的是 `/` (一份页面含下载+上传) — 这违背 ADR-14 "一个 QR 对应一个动作"。
+做法见 [QuickDrop.md §6 Phase 2 2.11](./QuickDrop.md):
+- `/` 改为电脑端 dashboard,显示 QR + 模式选择(发送/接收)
+- `/d` 手机端下载页,发送模式 QR 指向这里,仅文件信息 + 下载按钮
+- `/u` 手机端上传页,接收模式 QR 指向这里,仅上传表单
+- `quickdrop recv` 新子命令进入接收模式
 
 ### 待补验收
 
@@ -77,8 +86,7 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 
 ### 后续 Phase 2 顺位
 
-- 2.11 UI 分化(`/d` `/u` 路由拆分,见 QuickDrop.md ADR-14)
-- 2.7 Vue 工程化
+- 2.7 Vue 工程化(2.11 路由设计敲定后再上 Vue)
 - 2.4 Windows 右键菜单(注册表写入,有了之后才真正"无感")
 - 2.5 mDNS 发现 PC / 2.6 设备记忆
 - 2.8 WebSocket 进度 / 2.9 Windows toast
@@ -88,4 +96,5 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 ### 后续 Phase 2 才做的小项
 
 - 托盘图标用绘图软件画一个像样的(目前是纯蓝 16x16 占位)
-- daemon 模式发现端口被占但响应不是 QuickDrop 时,给用户更友好的报错 (现状是 ListenAndServe `log.Fatalf`,见旧版残留 daemon 那次踩坑)
+- daemon 模式发现端口被占但响应不是 QuickDrop 时,给用户更友好的报错
+- `QUICKDROP_WINDOW_MODE` 配置项最终应进配置页 UI (现在只能 env 设置)

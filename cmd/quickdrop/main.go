@@ -1,8 +1,9 @@
-// QuickDrop 入口: 两种模式
+// QuickDrop 入口: 三种模式
 //
-//  1. Daemon 模式: 端口 8443 空闲 → 起 HTTP server + 托盘, 常驻
-//  2. Client 模式: 端口已被 QuickDrop daemon 占用 → POST /internal/send 通知
-//     daemon 切换发送文件, 自己立刻退出
+//  1. window 子命令: 子进程, 只跑 webview 加载指定 URL (供 daemon fork)
+//  2. Daemon 模式:   端口 8443 空闲 → 起 HTTP server + 托盘, 常驻
+//  3. Client 模式:   端口已被 QuickDrop daemon 占用 → POST /internal/send 通知
+//                    daemon 切换发送文件, 自己立刻退出
 //
 // 解决重复 `quickdrop send X` 端口冲突的无感问题 (QuickDrop.md §6 2.2 + 2.3).
 //
@@ -23,29 +24,42 @@ import (
 
 	"quickdrop/internal/server"
 	"quickdrop/internal/tray"
+	"quickdrop/internal/window"
 )
 
-const daemonURL = "http://127.0.0.1:8443"
+const (
+	daemonURL = "http://127.0.0.1:8443"
+
+	// envWindowMode: 控制 daemon 弹 webview 窗口的策略.
+	//   replace    (默认): 切换文件时先杀旧窗再开新窗, 屏幕上始终 1 个窗
+	//   keep       : 切换文件时旧窗保留, 屏幕上可能并存多个窗
+	//   first-only : 只在 daemon 首次启动时弹窗, 切换文件不开新窗
+	envWindowMode = "QUICKDROP_WINDOW_MODE"
+)
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `QuickDrop - 局域网快速发送
 
 用法:
   %s send <文件路径>
-  %s <文件路径>           # 拖拽文件到 .exe 也走此分支
+  %s <文件路径>             # 拖拽文件到 .exe 也走此分支
+  %s window <url>           # 内部: webview 子进程入口, 不要手动调
+
+环境变量:
+  %s=replace|keep|first-only  控制窗口策略 (默认 replace)
 
 例:
   quickdrop.exe send C:\Users\you\Pictures\test.jpg
 
 如果 daemon 已经在跑, 会切换 daemon 当前发送的文件, 不重启进程.
-`, os.Args[0], os.Args[0])
+`, os.Args[0], os.Args[0], os.Args[0], envWindowMode)
 }
 
-// parseArgs 支持两种形态:
+// parseSendArgs 支持两种形态:
 //
 //	quickdrop send <path>   显式语法
 //	quickdrop <path>        拖拽到 .exe 时 Windows 直接把路径作为 args[0]
-func parseArgs() (string, error) {
+func parseSendArgs() (string, error) {
 	args := flag.Args()
 	if len(args) >= 1 && args[0] == "send" {
 		args = args[1:]
@@ -57,6 +71,19 @@ func parseArgs() (string, error) {
 }
 
 func main() {
+	// window 子命令是 daemon fork 出来的内部入口. 不走 flag.Parse,
+	// 因为 webview 不能被 flag 干扰. 必须最先判断.
+	if len(os.Args) >= 2 && os.Args[1] == "window" {
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: quickdrop window <url>")
+			os.Exit(1)
+		}
+		setupLogging() // 子进程也写同一个日志, 便于排查
+		log.Printf("--- window 子进程 pid=%d, url=%s ---", os.Getpid(), os.Args[2])
+		window.Run(os.Args[2], "QuickDrop", 0, 0)
+		return
+	}
+
 	flag.Usage = usage
 	flag.Parse()
 
@@ -64,7 +91,7 @@ func main() {
 	// 统一写 %TEMP%\quickdrop.log.
 	setupLogging()
 
-	rawPath, err := parseArgs()
+	rawPath, err := parseSendArgs()
 	if err != nil {
 		usage()
 		os.Exit(1)
@@ -121,21 +148,36 @@ func notifyDaemon(absPath string) error {
 	return nil
 }
 
-// runDaemon: 起 HTTP server + 托盘, 阻塞直到用户点 "退出".
+// runDaemon: 起 HTTP server + 托盘 + webview 子进程管理, 阻塞直到用户点 "退出".
 func runDaemon(absPath string) {
 	srv, err := server.New(absPath)
 	if err != nil {
 		log.Fatal(err)
 	}
-	// 文件切换时刷新托盘 tooltip
+
+	// webview 子进程管理器
+	selfExe, err := os.Executable()
+	if err != nil {
+		log.Fatalf("拿不到自身可执行路径: %v", err)
+	}
+	mode := window.ParseMode(os.Getenv(envWindowMode))
+	winMgr := window.NewManager(mode, selfExe)
+	log.Printf("窗口策略: %s (env %s=%s)", mode, envWindowMode, os.Getenv(envWindowMode))
+
+	// 文件切换时: 刷托盘 tooltip + 弹窗 (按 mode 策略)
 	srv.SetOnSwap(func(name string) {
 		tray.UpdateTooltip(name)
+		winMgr.OpenForFile(srv.HomeURL())
 	})
 	srv.Start()
 
+	// daemon 首次启动也开一个窗 (显示初始文件的 QR)
+	winMgr.OpenForFile(srv.HomeURL())
+
 	// systray.Run 阻塞 + 必须在 main goroutine.
-	// 用户点 "退出" → onExit 关 HTTP server → systray.Run 返回 → 进程退出.
+	// 用户点 "退出" → onExit 关 HTTP server + 杀所有 webview 子进程 → systray.Run 返回 → 进程退出.
 	tray.Run(srv.HomeURL(), srv.CurrentFileName(), func() {
+		winMgr.Shutdown()
 		srv.Shutdown()
 	})
 }
