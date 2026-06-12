@@ -1,15 +1,19 @@
 // QuickDrop 入口: 多种模式
 //
-//  1. window 子命令: 子进程, 只跑 webview 加载指定 URL (供 daemon fork)
-//  2. send <path> 模式:
+//  1. window 子命令:    子进程, 只跑 webview 加载指定 URL (供 daemon fork)
+//  2. install 子命令:   写注册表注册 Windows 右键菜单 "通过 QuickDrop 发送"
+//  3. uninstall 子命令: 删注册表条目
+//  4. status 子命令:    打印当前 daemon / 右键菜单注册状态
+//  5. send <path> 模式:
 //     - 端口 8443 空闲 → 起 daemon (HTTP server + 托盘) + 弹发送窗
 //     - 已被 QuickDrop daemon 占用 → POST /internal/send 通知切换, 客户端退出
-//  3. recv 模式:
+//  6. recv 模式:
 //     - 端口 8443 空闲 → 起 daemon (无文件) + 弹接收窗
 //     - 已被 QuickDrop daemon 占用 → POST /internal/receive on, 客户端退出
 //
 // 解决重复 `quickdrop send X` 端口冲突的无感问题 (QuickDrop.md §6 2.2 + 2.3).
 // 接收模式独立入口 + 安全分离 (2.13, ADR-17).
+// Windows 右键菜单 (2.4, 真正的核心交互).
 //
 // 不再像 Phase 1 早期那样自动开浏览器 (ADR-11: 浏览器破坏"无感").
 package main
@@ -25,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"quickdrop/internal/installer"
 	"quickdrop/internal/server"
 	"quickdrop/internal/tray"
 	"quickdrop/internal/window"
@@ -47,17 +52,18 @@ func usage() {
   %s send <文件路径>      发送模式
   %s <文件路径>           同上 (拖拽到 .exe 也走此分支)
   %s recv                 接收模式 (从手机往电脑传)
+  %s install              安装右键菜单 "通过 QuickDrop 发送"
+  %s uninstall            卸载右键菜单
+  %s status               打印当前 daemon / 右键菜单状态
   %s window <url>         内部: webview 子进程入口, 不要手动调
 
 环境变量:
   %s=replace|keep|first-only  控制发送窗口策略 (默认 replace)
 
 例:
-  quickdrop.exe send C:\Users\you\Pictures\test.jpg
-  quickdrop.exe recv
-
-如果 daemon 已经在跑, send 切换发送文件 / recv 开启接收, 不重启进程.
-`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], envWindowMode)
+  quickdrop.exe install
+  右键任意文件 → "通过 QuickDrop 发送"
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], envWindowMode)
 }
 
 func main() {
@@ -72,6 +78,26 @@ func main() {
 		log.Printf("--- window 子进程 pid=%d, url=%s ---", os.Getpid(), os.Args[2])
 		window.Run(os.Args[2], "QuickDrop", 0, 0)
 		return
+	}
+
+	// install / uninstall / status 子命令: 直接看 os.Args, 不走 flag.Parse,
+	// 避免 -q 被 flag 包当成未定义 flag 拒绝.
+	if len(os.Args) >= 2 {
+		quiet := len(os.Args) >= 3 && os.Args[2] == "-q"
+		switch os.Args[1] {
+		case "install":
+			setupLogging()
+			runInstall(quiet)
+			return
+		case "uninstall":
+			setupLogging()
+			runUninstall(quiet)
+			return
+		case "status":
+			setupLogging()
+			runStatus(quiet)
+			return
+		}
 	}
 
 	flag.Usage = usage
@@ -139,6 +165,70 @@ func runRecv() {
 	}
 	log.Print("未发现 daemon, 启动新的 daemon (接收模式)")
 	runDaemon("", true)
+}
+
+// runInstall 写入右键菜单注册表 + 弹 MessageBox 反馈.
+// 用户从 Explorer 双击或命令行调 `quickdrop install` 都走这.
+// 第二参 quiet=true 时不弹 MessageBox (脚本测试用).
+func runInstall(quiet bool) {
+	exe, err := os.Executable()
+	if err != nil {
+		if !quiet {
+			installer.MessageBox("QuickDrop 安装失败", "拿不到自身路径: "+err.Error(), installer.MBIconError)
+		}
+		log.Fatalf("os.Executable: %v", err)
+	}
+	if err := installer.Install(exe); err != nil {
+		if !quiet {
+			installer.MessageBox("QuickDrop 安装失败", err.Error(), installer.MBIconError)
+		}
+		log.Fatalf("Install: %v", err)
+	}
+	if !quiet {
+		msg := fmt.Sprintf("已注册右键菜单 \"通过 QuickDrop 发送\"\n\n"+
+			"使用: 右键任意文件 → \"通过 QuickDrop 发送\"\n"+
+			"(Win11 可能需要 Shift+右键 或 \"显示更多选项\")\n\n"+
+			"exe: %s", exe)
+		installer.MessageBox("QuickDrop 安装成功", msg, installer.MBIconInfo)
+	}
+	log.Printf("安装成功, exe=%s", exe)
+}
+
+func runUninstall(quiet bool) {
+	if err := installer.Uninstall(); err != nil {
+		if !quiet {
+			installer.MessageBox("QuickDrop 卸载失败", err.Error(), installer.MBIconError)
+		}
+		log.Fatalf("Uninstall: %v", err)
+	}
+	if !quiet {
+		installer.MessageBox("QuickDrop 卸载成功", "已从注册表删除右键菜单条目", installer.MBIconInfo)
+	}
+	log.Print("卸载成功")
+}
+
+func runStatus(quiet bool) {
+	exe, _ := os.Executable()
+	installed, cmd := installer.IsInstalled()
+	daemonAlive := probeDaemon()
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "当前 exe: %s\n\n", exe)
+	if installed {
+		fmt.Fprintf(&b, "右键菜单: 已注册\n  command = %s\n", cmd)
+	} else {
+		fmt.Fprintf(&b, "右键菜单: 未注册 (跑 quickdrop install 注册)\n")
+	}
+	fmt.Fprintf(&b, "\nDaemon: ")
+	if daemonAlive {
+		fmt.Fprintf(&b, "运行中 (127.0.0.1:8443)\n")
+	} else {
+		fmt.Fprintf(&b, "未运行\n")
+	}
+	if !quiet {
+		installer.MessageBox("QuickDrop 状态", b.String(), installer.MBIconInfo)
+	}
+	log.Print(b.String())
 }
 
 // probeDaemon GET /internal/health, 判断本机 8443 是不是 QuickDrop daemon.

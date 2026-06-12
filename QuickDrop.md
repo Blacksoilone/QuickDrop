@@ -78,7 +78,7 @@ Windows 上没有的 AirDrop —— 右键文件即发送,扫码即接收,局域
 - **2.1** 拆包:`cmd/quickdrop/main.go` + `internal/server` + `internal/qr` + `internal/tray`
 - **2.2** Daemon 模式:第一次启动常驻;后续 `quickdrop send X` 检测 daemon 已跑就走 IPC,不重启进程
 - **2.3** IPC:HTTP 到 `127.0.0.1:8443/internal/send`,先不上 Named Pipe
-- **2.4** Windows 右键菜单:写注册表 `HKCU\Software\Classes\*\shell\QuickDrop\command`,值 `"C:\path\quickdrop.exe" send "%1"`
+- **2.4** Windows 右键菜单(已实现 v0.6.0):`quickdrop install` 写注册表 `HKCU\Software\Classes\*\shell\QuickDrop\command`,值 `"C:\path\quickdrop.exe" send "%1"`。`uninstall` 删,`status` 看。用户级 (HKCU) 无需 UAC。**Win11 限制**:传统注册表方式在 Win11 下显示在 "显示更多选项" 里 (Shift+右键直达),顶级菜单需要 MSIX sparse package + IExplorerCommand (留 Phase 4,见 ADR-18)
 - **2.5** mDNS 广播 + 发现 PC 列表
 - **2.6** 设备记忆:JSON `~/.quickdrop/devices.json`
 - **2.7** Vue 3 工程化:`web/` 目录,vite 构建,产物用 `embed.FS` 打进 .exe
@@ -146,3 +146,4 @@ Windows 上没有的 AirDrop —— 右键文件即发送,扫码即接收,局域
 | 15 | **WebView2 跑独立子进程**, 不和 systray 同进程 | systray 和 webview 都要求独占 main goroutine 跑 Windows 消息循环, 同进程会抢消息(webview issue #650, systray #195)。daemon fork `quickdrop window <url>` 子进程跑 webview, 用户关窗 → 子进程退出 → daemon 不受影响。天然契合"分享完即关"的体验, 且跨平台不打架 |
 | 16 | **window-mode 三种策略 (replace/keep/first-only)** 由 env `QUICKDROP_WINDOW_MODE` 配置 | 一次 send 一个文件给一个人 → replace (默认, 屏幕始终 1 窗); 多文件多人 → keep (屏幕保留所有 QR 窗); 嫌烦 → first-only (只首次开窗)。Phase 2 后期配置页 UI 实装时把 env 移过去 |
 | 17 | **极简 UI 修订** (完全推翻 ADR-13, 加强 ADR-14, 引入安全约束) | 实际用了一下发现 Phase 1/2.10 UI 长且没固定宽度、电脑端弹窗里居然有"上传"区块、手机扫码进的下载页又显示 QR——全是冗余。新方案: (1) **电脑端弹窗只显示 QR + 文件名 + 大小 + 关闭键**, 无边框, 固定 ~280px 宽; (2) **手机端发送页用文件图标/缩略图替代 QR** (手机不需要看自己的 QR); (3) **手机端默认无上传功能** — 任何陌生人扫到 QR 都能往你电脑塞文件是真实安全风险, 上传仅在用户主动进"接收模式"后才可用; (4) **复杂功能 (选文件 / 接收文件 / 配置)** 从弹窗剥离, 走托盘菜单或独立配置页, 弹窗保持极简 |
+| 18 | **右键菜单走传统注册表 HKCU, Win11 顶级显示留 Phase 4** | 传统 `HKCU\Software\Classes\*\shell\X\command` 注册表方式: 简单 (~80 行 Go), 用户级无需 UAC, Win10 完美工作, Win11 显示在 "显示更多选项" / Shift+右键里。Win11 顶级菜单 (跟"复制""粘贴"同级) 需要 MSIX sparse package + IExplorerCommand COM, 工程量大且需打包安装器。先解决 90% 场景, MSIX 留 Phase 4 |

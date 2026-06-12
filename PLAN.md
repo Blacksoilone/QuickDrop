@@ -31,6 +31,8 @@ internal/tray/tray.go         systray, 菜单(复制链接/接收文件 checkbox
 internal/tray/icon.ico        托盘图标 16x16 (Windows systray 必须 ICO,不能 PNG)
 internal/window/window.go     webview 子进程实际渲染函数 (runWebview, 含 quickdropClose binding)
 internal/window/manager.go    daemon 持有的子进程管理器 + Mode + recvCmd (发送窗+接收窗独立)
+internal/installer/registry.go  Windows 右键菜单注册表读写 (HKCU 用户级,无需 UAC)
+internal/installer/msgbox.go    Win32 MessageBoxW 包装 (windowsgui 模式下唯一可视反馈)
 build.ps1                     一键构建脚本
 test/prepare-fixtures.ps1     生成 500MB big.bin + 你好世界.png 验收固件
 test/test-crash-cleanup.ps1   验收用例 5 自动化 (中途崩溃 → 重启清理)
@@ -38,6 +40,7 @@ test/test-daemon-switch.ps1   Phase 2.2+2.3 验收: daemon 健康检查 / 客户
 test/test-window.ps1          Phase 2.10 验收: webview 子进程 + 三种 window-mode
 test/test-routes.ps1          Phase 2.11 + 2.10 UI 验收: ADR-17 路由语义
 test/test-receive.ps1         Phase 2.13 验收: 接收模式独立入口 + /u 状态切换 + 上传落盘
+test/test-install.ps1         Phase 2.4 验收: 注册表 install/uninstall/status + 幂等
 TEST.md                       Phase 1 验收清单 (手动 + 自动)
 ```
 
@@ -76,6 +79,14 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
   - "停止接收"按钮: HTML `fetch /internal/receive off → quickdropClose()` 一键关接收+关窗
   - 接收窗 webview 子进程独立于发送窗 (Manager.recvCmd 单实例字段, 不受 window-mode 影响)
   - test-receive.ps1 17 checks ALL PASS (含 LAN 拦截 + 真实上传落盘验证)
+- [x] **任务 2.4 Windows 右键菜单**:
+  - `quickdrop install` / `uninstall` / `status` 三个新子命令
+  - 注册到 `HKCU\Software\Classes\*\shell\QuickDrop` (用户级, 无需 UAC)
+  - 菜单文字 "通过 QuickDrop 发送", 命令 `"<exe>" send "%1"`, 含空格路径安全 (双引号包)
+  - Icon 字段指向 exe 的图标 0 (复用 systray icon 资源)
+  - windowsgui 模式下用 Win32 MessageBoxW 给安装结果反馈; `-q` 静默给脚本测试用
+  - test-install.ps1 18 checks ALL PASS (写入/幂等/状态/卸载/卸载幂等/路径含引号)
+  - **真正的核心交互**: 右键文件 → "通过 QuickDrop 发送" → 1 秒内弹 QR 窗
 
 ## 4. 遇到的问题
 
@@ -96,14 +107,14 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 
 按 [QuickDrop.md §6 Phase 2](./QuickDrop.md):
 
-- **2.4 Windows 右键菜单**: 注册表写入,装上之后用户右键文件 → "通过 QuickDrop 发送",才真正"无感"
-- **2.7 Vue 工程化**: 路由已稳 (`/`、`/d`、`/r`、`/u`),可上 Vue 重写模板
-- **2.5 + 2.6** mDNS 发现 PC + 设备记忆
-- **2.8 + 2.9** WebSocket 进度 + Windows toast
+- **2.7 Vue 工程化**: 路由已稳 (`/`、`/d`、`/r`、`/u`),可上 Vue 重写模板,把 dashboard / 下载 / 接收 三套页用组件化重构
+- **2.5 + 2.6** mDNS 发现 PC + 设备记忆: 发送时除手机扫码外,可点列表里的 PC 直接发
+- **2.8 + 2.9** WebSocket 进度 + Windows toast: 实时进度条 + 接收方桌面通知
 
 ### 待补验收
 
 - ⏸ TEST.md 用例 6 多手机并发(等借到第二台手机)
+- ⏸ Win11 实地复核右键菜单显示位置 (Shift+右键 / "显示更多选项")
 
 ### 后续 Phase 2 才做的小项
 
@@ -111,3 +122,4 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 - daemon 模式发现端口被占但响应不是 QuickDrop 时,给用户更友好的报错
 - `QUICKDROP_WINDOW_MODE` 配置项最终应进配置页 UI (现在只能 env 设置)
 - 接收完成后自动关闭接收模式 (现在要用户手动点"停止接收"或托盘取消勾,有可能忘了一直开着)
+- Win11 现代右键菜单 (顶级显示, 不需 Shift): 需要 MSIX sparse package + IExplorerCommand,工程量大,留 Phase 4
