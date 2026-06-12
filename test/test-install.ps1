@@ -115,11 +115,11 @@ $log = ReadLogUTF8
 Check "log 包含 '未注册'" ($log -match "未注册")
 
 # Restore: 还原备份
-if ($hadPrev) {
-    Write-Host ""
-    Write-Host "Restoring previous registry state..." -ForegroundColor Yellow
-    RunExe @("install","-q") | Out-Null
-}
+# 还原 install: 同 test-toast.ps1, 测试结束总让 install 在位.
+# 否则下次用户跑 daemon 收 toast 会无法接受.
+Write-Host ""
+Write-Host "Restoring install state (always end with install present)..." -ForegroundColor Yellow
+RunExe @("install","-q") | Out-Null
 
 Write-Host ""
 if ($fail -eq 0) {

@@ -114,12 +114,12 @@ Check "右键菜单主键不存在" (-not (Test-Path -LiteralPath "HKCU:\Softwar
 Check "URL scheme 主键不存在" (-not (Test-Path -LiteralPath $schemePath))
 Check "URL scheme command 子键不存在" (-not (Test-Path -LiteralPath $schemeCmd))
 
-# 还原备份: 如果脚本前已 install 过, 重新 install
-if ($hadCtx -or $hadScheme) {
-    Write-Host ""
-    Write-Host "Restoring previous install state..." -ForegroundColor Yellow
-    RunExe @("install","-q") | Out-Null
-}
+# 还原 install: 测试中我们 install + uninstall 各一次, 结束时 install 必须重新装回去,
+# 否则用户接下来用 toast 接收会报 "没有应用能打开此链接".
+# (即使脚本前用户没装, 也把 install 留着, 因为这是个开发用 PC, 装着无副作用.)
+Write-Host ""
+Write-Host "Restoring install state (always end with install present)..." -ForegroundColor Yellow
+RunExe @("install","-q") | Out-Null
 
 Write-Host ""
 if ($fail -eq 0) {

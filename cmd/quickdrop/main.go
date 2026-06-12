@@ -370,6 +370,13 @@ func runDaemon(initialPath string, initialReceive bool) {
 	}
 	log.Printf("身份: %s (%s)", ident.Name, ident.UUID[:8])
 
+	// 自检: URL scheme 未注册时 toast 按钮点了会报 "没有应用能打开此链接".
+	// 不致命 (用户可能只想发送), 但 log warn 提示用户跑 install 修复.
+	if !installer.IsURLSchemeInstalled() {
+		log.Print("WARN: quickdrop:// URL scheme 未注册, toast 接收按钮将无法工作. " +
+			"运行 `quickdrop install` 修复 (右键菜单 + URL scheme 一起装)")
+	}
+
 	srv, err := server.New(initialPath, port)
 	if err != nil {
 		log.Fatal(err)
