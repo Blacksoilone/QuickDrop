@@ -562,6 +562,10 @@ func (s *Server) handlePeerFile(w http.ResponseWriter, r *http.Request) {
 
 // handleInternalPeerSend POST /internal/peer-send : Alice 端 CLI/Vue 触发发文件给指定对端.
 // body = JSON { toUUID, filePath } (mDNS 路径), 或 { toIPv4, toPort, filePath } (直连旁路)
+//
+// filePath 为空时用当前 daemon 的 absPath (dashboard 调用: 用户已通过 send X 设定了当前文件,
+// 不想 Vue 拿到绝对路径).
+//
 // 步骤: 1) 找对端坐标  2) CreateOutgoing 拿 token  3) POST 到对端 /peer/incoming
 //       4) 返回 token 给客户端
 //
@@ -587,9 +591,16 @@ func (s *Server) handleInternalPeerSend(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "解析 body 失败: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	// filePath 为空时用当前 daemon 的发送文件 (Vue dashboard "发送到 X" 走这条)
 	if body.FilePath == "" {
-		http.Error(w, "filePath 不能为空", http.StatusBadRequest)
-		return
+		s.mu.RLock()
+		body.FilePath = s.absPath
+		s.mu.RUnlock()
+		if body.FilePath == "" {
+			http.Error(w, "filePath 未指定且 daemon 当前无发送文件", http.StatusBadRequest)
+			return
+		}
 	}
 
 	// 解析对端坐标: 优先 mDNS UUID 查找, 失败回退到 toIPv4/toPort
