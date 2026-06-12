@@ -197,16 +197,35 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
 ### 下一步候选
 
 Phase 2 主体已交付 (2.2/2.3/2.4/2.5a-e/2.7/2.10/2.11/2.13/2.6).
+v0.10.x 小修 (2.8 + 2.9 + 托盘设备管理) 已完成.
+v0.11.0 配置中心 (8 项配置 + UI + 设备合并) 已完成.
 剩余:
 
-- **2.8 + 2.9** WebSocket 进度 + Windows toast 完成提示: 实时进度条 + 文件传输完成的轻通知
-- **小修**: 托盘加 "设备管理" 菜单项 → 开 /v 子窗 (现在用户得手动访问 URL)
 - **Phase 3** 起步: HTTPS via lancert.dev + PWA manifest, 真机适配
 
-### 后续 Phase 2 顺位
+### v0.11.x / v0.12 配置项扩展池 (用户暂缓, 后续按需挑)
 
-- **2.8 + 2.9** WebSocket 进度 + Windows toast 完成提示: 实时进度条 + 文件传输完成的轻通知
-- **Phase 3 起步**: HTTPS via lancert.dev + PWA manifest, 真机适配开始
+第一轮 (v0.11.0) 已交付 8 项: download.dir / download.conflict / server.port /
+server.mdns_enabled / receive.max_file_size / ui.toasts_enabled / ui.reveal_on_done /
+system.autostart.
+
+下面这些是用户审过的但说"暂时不做, 后续可能添加"的候选, 各自的语义已经讨论过:
+
+- **receive.ask_before_accept** — 接收前是否弹确认窗 (默认 false: 当前直接 toast)
+- **receive.max_pending** — 接收数量上限 (防 toast 轰炸; 触上限后新 incoming 直接 reject)
+- **receive.pending_ttl_sec** — pending TTL 可配 (现在硬编码 30 min)
+- **receive.default_on** — daemon 启动是否默认开接收模式 (现在默认关)
+- **ui.window.send_auto_close_sec** — 发送窗自动关闭 (现在常驻)
+- **ui.window.width / height / dpi** — 窗口尺寸 / DPI 偏好
+- **log.path / log.level** — 日志路径 / 级别 (现在固定 %TEMP%\quickdrop.log)
+- **net.https_cert_path / key_path** — HTTPS 证书路径 (Phase 3)
+- **ui.hotkey.global** — 全局热键 (Ctrl+Alt+Q 等)
+- **system.post_receive_hook** — 接收完成自定义命令钩子 (用户脚本)
+- **identity.broadcast_name** — 设备显示名独立于 hostname (现在用 identity.Name)
+- **ui.window_mode** — 当前是 env QUICKDROP_WINDOW_MODE (replace/keep/first-only) 应进 config
+
+加入时机: 用户主动提"加 X"再做, 不需要全部一次性. config.json 已支持 partial body
+解析, 加字段无破坏性升级.
 
 ### 待补验收
 
