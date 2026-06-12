@@ -170,6 +170,28 @@ $pending2 = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8444/api/pending
 $item2 = @($pending2) | Where-Object { $_.token -eq $token2 } | Select-Object -First 1
 Check "Bob pending 该 token state=rejected" ($item2.state -eq "rejected")
 
+Write-Host ""
+Write-Host "=== url-action 路径 (= toast 接受按钮等价) ===" -ForegroundColor Cyan
+# Alice 第三次发, Bob 用 url-action 子命令 accept (模拟 Windows shell 启动 quickdrop://accept?token=xxx)
+$r = Invoke-WebRequest -UseBasicParsing -Method Post -Uri http://127.0.0.1:8443/internal/peer-send -Body $sendBody -ContentType "application/json"
+$token3 = ($r.Content | ConvertFrom-Json).token
+Get-ChildItem $dlDir -Filter "test.png" -ErrorAction SilentlyContinue | Remove-Item -Force
+# 跑 quickdrop url-action quickdrop://accept?token=xxx, 必须设 QUICKDROP_PORT 让它找到 Bob (8444)
+$pi = New-Object System.Diagnostics.ProcessStartInfo
+$pi.FileName = $exe
+$pi.Arguments = 'url-action "quickdrop://accept?token=' + $token3 + '"'
+$pi.UseShellExecute = $false
+$pi.WindowStyle = "Hidden"
+$pi.EnvironmentVariables["QUICKDROP_PORT"] = "8444"
+$urlProc = [System.Diagnostics.Process]::Start($pi)
+$ok = $urlProc.WaitForExit(5000)
+Check "url-action 子命令 5 秒内退出" $ok
+Check "url-action 退出码 0" ($urlProc.ExitCode -eq 0)
+# Bob 异步 Pull, 等几秒
+Start-Sleep -Seconds 3
+$dst3 = Join-Path $dlDir "test.png"
+Check "url-action accept 后文件落盘" (Test-Path -LiteralPath $dst3)
+
 # 清理
 Stop-Process -Id $pA.Id -Force -ErrorAction SilentlyContinue
 Stop-Process -Id $pB.Id -Force -ErrorAction SilentlyContinue
