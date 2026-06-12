@@ -61,7 +61,7 @@ const dashboardHTMLTpl = `<!doctype html>
   </style>
 </head>
 <body>
-  <button class="close" onclick="window.close()" title="关闭 (daemon 继续运行)">×</button>
+  <button class="close" onclick="quickdropClose()" title="关闭 (daemon 继续运行)">×</button>
   <div class="wrap">
     <div class="qr"><img src="/qr" alt="扫码下载"></div>
     <div class="name">%s</div>

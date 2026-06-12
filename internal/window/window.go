@@ -13,6 +13,9 @@ import (
 //
 // 真"无边框"需要原生 WIN32 API 去掉 WS_CAPTION, webview_go 不直接暴露,
 // 工程量大, 先用最小尺寸的标题栏窗口. 后续若必要再走 cgo 调 SetWindowLong.
+//
+// 关闭按钮: webview2 里 JS 的 window.close() 只能关 JS 自己 open 的窗口,
+// host 创建的窗口它管不到. 用 Bind 注册一个 Go 函数, HTML 调它走 w.Terminate().
 func runWebview(url, title string, width, height int) {
 	if width == 0 {
 		width = 264
@@ -26,6 +29,14 @@ func runWebview(url, title string, width, height int) {
 		log.Fatal("webview.New 返回 nil, WebView2 Runtime 没装?")
 	}
 	defer w.Destroy()
+
+	// HTML 关闭按钮的 onclick=quickdropClose() 走这, 触发主循环退出.
+	// Bind 必须在 Navigate 之前 (Navigate 后再 Bind 当次加载用不上).
+	if err := w.Bind("quickdropClose", func() {
+		w.Terminate()
+	}); err != nil {
+		log.Printf("绑定 quickdropClose 失败: %v", err)
+	}
 
 	w.SetTitle(title)
 	w.SetSize(width, height, webview.HintFixed) // 不让用户改大小
