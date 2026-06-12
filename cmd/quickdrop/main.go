@@ -19,6 +19,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"flag"
 	"fmt"
@@ -39,6 +40,7 @@ import (
 	"quickdrop/internal/installer"
 	"quickdrop/internal/notify"
 	"quickdrop/internal/peer"
+	"quickdrop/internal/progress"
 	"quickdrop/internal/server"
 	"quickdrop/internal/tray"
 	"quickdrop/internal/window"
@@ -385,6 +387,7 @@ func runDaemon(initialPath string, initialReceive bool) {
 	srv.SetDist(distFS)
 	srv.SetIdentity(ident.UUID, ident.Name)
 	srv.SetPeerManager(peerMgrAdapter{peer.NewManager()})
+	srv.SetProgressHub(progressHubAdapter{progress.NewHub()})
 
 	// 加载设备信任表 (ADR-20). 失败不致命, 退回到"所有设备 ask".
 	if devStore, err := devices.Load(); err == nil {
@@ -621,6 +624,29 @@ func (a deviceStoreAdapter) All() []server.DeviceEntry {
 		}
 	}
 	return out
+}
+
+// progressHubAdapter 把 internal/progress.Hub 适配成 server.ProgressPublisher.
+type progressHubAdapter struct{ h *progress.Hub }
+
+func (a progressHubAdapter) WrapReader(r io.Reader, id, kind, fileName string, fileSize int64) server.ProgressReader {
+	return a.h.WrapReader(r, id, progress.Kind(kind), fileName, fileSize)
+}
+
+func (a progressHubAdapter) ServeWS(ctx context.Context, conn server.ProgressConn) {
+	a.h.ServeWS(ctx, progressConnAdapter{conn})
+}
+
+// progressConnAdapter 把 server.ProgressConn 适配成 progress.Conn.
+// 两边接口签名其实相同, 这层只为类型别名.
+type progressConnAdapter struct{ c server.ProgressConn }
+
+func (a progressConnAdapter) Write(ctx context.Context, msg []byte) error {
+	return a.c.Write(ctx, msg)
+}
+
+func (a progressConnAdapter) Close(code int, reason string) error {
+	return a.c.Close(code, reason)
 }
 
 func setupLogging() {

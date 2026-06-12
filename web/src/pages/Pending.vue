@@ -1,28 +1,45 @@
 <script setup lang="ts">
 // 待处理 incoming 列表页 (托盘 "待处理 (N)" 点开走这里).
 // 列出 pending 队列, 每条可接受/拒绝. 接受后 daemon 异步 Pull 文件.
+// 同时订阅 /ws 进度事件, 给"已接受"的条目显示实时进度条.
 import { onMounted, onUnmounted, ref } from "vue";
 import {
   closeWindow,
   decidePeer,
   fetchPending,
+  subscribeProgress,
   type PendingEntry,
+  type ProgressEvent,
 } from "../api";
 
 const items = ref<PendingEntry[]>([]);
 const error = ref<string>("");
 // token → 是否勾选了"信任此设备" (Accept 同时设 trusted, Reject 同时设 blocked)
 const trustOnAccept = ref<Record<string, boolean>>({});
+// token → 当前进度事件 (来自 /ws)
+const progress = ref<Record<string, ProgressEvent>>({});
 let timer: number | undefined;
+let unsubWS: (() => void) | undefined;
 
 onMounted(async () => {
   await refresh();
   // 每 2 秒刷新, 让状态变化 (accepted/rejected) 反映出来
   timer = window.setInterval(refresh, 2000);
+  // 订阅进度
+  unsubWS = subscribeProgress((e) => {
+    progress.value[e.id] = e;
+    // done 后保留 5 秒让用户看清最终状态再清掉
+    if (e.done) {
+      window.setTimeout(() => {
+        delete progress.value[e.id];
+      }, 5000);
+    }
+  });
 });
 
 onUnmounted(() => {
   if (timer !== undefined) window.clearInterval(timer);
+  if (unsubWS) unsubWS();
 });
 
 async function refresh() {
@@ -76,6 +93,11 @@ function stateLabel(s: PendingEntry["state"]): string {
       return "已超时";
   }
 }
+
+function percent(e: ProgressEvent): number {
+  if (!e || e.fileSize <= 0) return 0;
+  return Math.min(100, Math.floor((e.bytes / e.fileSize) * 100));
+}
 </script>
 
 <template>
@@ -97,6 +119,16 @@ function stateLabel(s: PendingEntry["state"]): string {
           <div class="sub">
             来自 <b>{{ p.from.name }}</b> · {{ humanSize(p.fileSize) }} ·
             <span class="state">{{ stateLabel(p.state) }}</span>
+          </div>
+          <!-- 进度条: state=accepted 且 ws 有最新事件时显示 -->
+          <div v-if="progress[p.token] && !progress[p.token].done" class="progress">
+            <div class="bar">
+              <div class="fill" :style="{ width: percent(progress[p.token]) + '%' }"></div>
+            </div>
+            <div class="pct">{{ percent(progress[p.token]) }}% · {{ humanSize(progress[p.token].bytes) }} / {{ humanSize(p.fileSize) }}</div>
+          </div>
+          <div v-else-if="progress[p.token] && progress[p.token].done && !progress[p.token].err" class="progress done">
+            ✓ 完成
           </div>
         </div>
         <div class="actions" v-if="p.state === 'pending'">
@@ -214,6 +246,39 @@ h1 {
 .state {
   font-weight: 500;
 }
+.progress {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #555;
+}
+.progress.done {
+  color: #2a7;
+  font-weight: 500;
+}
+.progress .bar {
+  width: 100%;
+  height: 4px;
+  background: #eee;
+  border-radius: 2px;
+  overflow: hidden;
+  margin-bottom: 2px;
+}
+.progress .fill {
+  height: 100%;
+  background: #0066ff;
+  transition: width 200ms linear;
+}
+.progress .pct {
+  font-size: 10px;
+  color: #888;
+}
+@media (prefers-color-scheme: dark) {
+  .progress { color: #aaa; }
+  .progress .bar { background: #333; }
+  .progress .pct { color: #999; }
+  .progress.done { color: #7c5; }
+}
+
 .actions {
   display: flex;
   gap: 6px;

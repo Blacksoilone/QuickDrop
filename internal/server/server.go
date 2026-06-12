@@ -21,6 +21,8 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,6 +37,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/coder/websocket"
 
 	"quickdrop/internal/qr"
 )
@@ -78,6 +82,9 @@ type Server struct {
 	// deviceStore 设备信任表 (ADR-20). 由 SetDeviceStore 注入.
 	// nil 时所有设备视为 ask, /api/devices 返回空.
 	deviceStore DeviceStore
+
+	// progress 推实时传输进度给 Vue (/ws). 由 SetProgressHub 注入. nil 时不推.
+	progress ProgressPublisher
 
 	// myIdentity 本机身份 (UUID + 显示名), 给 /peer/incoming 时填 from 字段用.
 	// 由 SetIdentity 注入.
@@ -152,6 +159,29 @@ type DeviceEntry struct {
 	Trust     string `json:"trust"`
 	FirstSeen int64  `json:"firstSeen"`
 	LastSeen  int64  `json:"lastSeen"`
+}
+
+// ProgressPublisher 注入接口, server 通过它发布传输进度事件.
+// 实际实现是 internal/progress.Hub. 抽 interface 避免 server 直接依赖 progress 包.
+type ProgressPublisher interface {
+	// WrapReader 包装一个 io.Reader 让其按字节计数 + 节流推进度.
+	// fileSize=-1 表示未知.
+	// 返回的 reader 实现 io.Reader, 同时有一个 Done(err) 方法可以在结束时强制推最终一帧.
+	WrapReader(r io.Reader, id, kind, fileName string, fileSize int64) ProgressReader
+	// ServeWS 给一个 ws 连接跑订阅 → 写循环, 阻塞到 ctx done 或 client 断开.
+	ServeWS(ctx context.Context, conn ProgressConn)
+}
+
+// ProgressReader 由 WrapReader 返回. 透传 Read, 额外有 Done().
+type ProgressReader interface {
+	io.Reader
+	Done(err error)
+}
+
+// ProgressConn 由 ServeWS 用. websocket conn 实现.
+type ProgressConn interface {
+	Write(ctx context.Context, msg []byte) error
+	Close(code int, reason string) error
 }
 
 // Peer 与 internal/discovery.Peer 字段同名同义, 为了 server → JSON 转换不引入循环依赖,
@@ -320,6 +350,12 @@ func (s *Server) SetDeviceStore(d DeviceStore) {
 	s.deviceStore = d
 }
 
+// SetProgressHub 注入进度发布器 (来自 internal/progress.Hub).
+// 必须在 Start 之前调用. nil 时 /ws 返回 404 + 文件传输不推进度.
+func (s *Server) SetProgressHub(p ProgressPublisher) {
+	s.progress = p
+}
+
 // emitPendingChange 在 peer manager 状态可能变化后调用.
 // 拉最新 pending count 传给回调. 由 handlePeerIncoming / handleInternalPeerDecide 等触发.
 func (s *Server) emitPendingChange() {
@@ -390,6 +426,8 @@ func (s *Server) Start() {
 	mux.HandleFunc("/internal/peer-send", requireLocal(s.handleInternalPeerSend))
 	mux.HandleFunc("/internal/peer-decide", requireLocal(s.handleInternalPeerDecide))
 	mux.HandleFunc("/internal/device-trust", requireLocal(s.handleInternalDeviceTrust))
+	// WebSocket: 推实时传输进度给 Vue. 任意 LAN 都能连 (只读, 不暴露敏感信息).
+	mux.HandleFunc("/ws", s.handleWS)
 	// 静态资源 (Vue chunks / CSS)
 	mux.Handle("/assets/", http.FileServer(http.FS(s.dist)))
 
@@ -605,6 +643,37 @@ func (s *Server) handleAPIDevices(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(list)
+}
+
+// handleWS /ws : 给 Vue 推实时传输进度. 任意 LAN 都能连 (内容只读, 不含敏感信息).
+// progress hub 不在则 404.
+func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	if s.progress == nil {
+		http.NotFound(w, r)
+		return
+	}
+	// InsecureSkipVerify: 我们的 LAN 场景没 Origin 强校验需求 (浏览器/webview/手机都行)
+	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		log.Printf("ws accept 失败: %v", err)
+		return
+	}
+	// Adapter: coder/websocket.Conn → progress.ProgressConn
+	conn := wsConnAdapter{c}
+	s.progress.ServeWS(r.Context(), conn)
+}
+
+// wsConnAdapter 把 coder/websocket.Conn 适配成 server.ProgressConn (= progress.Conn).
+type wsConnAdapter struct{ c *websocket.Conn }
+
+func (a wsConnAdapter) Write(ctx context.Context, msg []byte) error {
+	return a.c.Write(ctx, websocket.MessageText, msg)
+}
+
+func (a wsConnAdapter) Close(code int, reason string) error {
+	return a.c.Close(websocket.StatusCode(code), reason)
 }
 
 // handlePeerIncoming POST /peer/incoming : 来自其他 daemon 的发送邀请.
@@ -967,8 +1036,20 @@ func (s *Server) pullPeerFile(token, fromIPv4 string, fromPort int, fromName, fi
 	safeName := filepath.Base(fileName)
 	finalPath := filepath.Join(dir, safeName)
 	tmpPath := finalPath + ".tmp"
-	if err := saveStream(tmpPath, finalPath, resp.Body); err != nil {
-		log.Printf("Pull 写入失败 (token=%s): %v", token[:8], err)
+
+	// 包 progress reader 推实时进度给 Vue. nil 时直接用原始 body.
+	var src io.Reader = resp.Body
+	var pr ProgressReader
+	if s.progress != nil {
+		pr = s.progress.WrapReader(resp.Body, token, "receive", fileName, fileSize)
+		src = pr
+	}
+	saveErr := saveStream(tmpPath, finalPath, src)
+	if pr != nil {
+		pr.Done(saveErr)
+	}
+	if saveErr != nil {
+		log.Printf("Pull 写入失败 (token=%s): %v", token[:8], saveErr)
 		return
 	}
 	log.Printf("Pull peer 完成: %s (%d 字节) silent=%v", finalPath, fileSize, silent)
@@ -1109,10 +1190,23 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		finalPath := filepath.Join(dir, safeName)
 		tmpPath := finalPath + ".tmp"
 
-		if err := saveStream(tmpPath, finalPath, part); err != nil {
+		// 包 progress reader. multipart part 不知道精确大小, 用 r.ContentLength 当上限
+		// (会包括其他字段, 但近似够用; 前端拿 bytes / fileSize 算百分比时会少于 100).
+		var src io.Reader = part
+		var pr ProgressReader
+		if s.progress != nil {
+			uid := uploadProgressID()
+			pr = s.progress.WrapReader(part, uid, "upload", safeName, r.ContentLength)
+			src = pr
+		}
+		saveErr := saveStream(tmpPath, finalPath, src)
+		if pr != nil {
+			pr.Done(saveErr)
+		}
+		if saveErr != nil {
 			part.Close()
-			log.Printf("接收 %s 失败: %v", safeName, err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("接收 %s 失败: %v", safeName, saveErr)
+			http.Error(w, saveErr.Error(), http.StatusInternalServerError)
 			return
 		}
 		part.Close()
@@ -1223,6 +1317,14 @@ func cleanupStaleTmp() {
 	if n > 0 {
 		log.Printf("启动清理: 删除 %d 个残留 *.tmp", n)
 	}
+}
+
+// uploadProgressID 给每个手机 upload part 生成一个进度 ID (用于 Vue 区分多个并行 upload).
+// 16 字符 hex.
+func uploadProgressID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return "upload-" + hex.EncodeToString(b)
 }
 
 func humanSize(n int64) string {

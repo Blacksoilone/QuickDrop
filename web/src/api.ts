@@ -98,6 +98,60 @@ export async function setDeviceTrust(
   }
 }
 
+// ProgressEvent 与 server 端 progress.Event 保持一致.
+export interface ProgressEvent {
+  id: string;
+  kind: "send" | "receive" | "upload" | "download";
+  fileName: string;
+  fileSize: number;
+  bytes: number;
+  done: boolean;
+  err?: string;
+  at: number; // Unix 毫秒
+}
+
+// subscribeProgress 连 /ws, 每帧调 onEvent. 断线自动 3 秒重连.
+// 返回 unsubscribe 函数: 调了之后停止重连 + 关连接.
+export function subscribeProgress(onEvent: (e: ProgressEvent) => void): () => void {
+  let ws: WebSocket | null = null;
+  let stopped = false;
+  let reconnectTimer: number | undefined;
+
+  function connect() {
+    if (stopped) return;
+    // /ws 同源, 自动用 ws:// (HTTP) 或 wss:// (HTTPS Phase 3)
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${location.host}/ws`;
+    ws = new WebSocket(url);
+    ws.onmessage = (msg) => {
+      try {
+        const ev = JSON.parse(msg.data) as ProgressEvent;
+        onEvent(ev);
+      } catch {
+        /* ignore malformed */
+      }
+    };
+    ws.onclose = () => {
+      ws = null;
+      if (!stopped) {
+        reconnectTimer = window.setTimeout(connect, 3000);
+      }
+    };
+    ws.onerror = () => {
+      // 让 onclose 处理重连
+      if (ws) ws.close();
+    };
+  }
+
+  connect();
+
+  return () => {
+    stopped = true;
+    if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+    if (ws) ws.close();
+  };
+}
+
 // 给 daemon 发 IPC: 把 daemon 当前的发送文件发给指定 UUID 对端.
 // daemon 自己 POST 对端 /peer/incoming, 触发对端 toast.
 // filePath 不传, daemon 用自己的 s.absPath (Vue 不需要也不该知道绝对路径).
