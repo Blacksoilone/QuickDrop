@@ -81,7 +81,7 @@ Windows 上没有的 AirDrop —— 右键文件即发送,扫码即接收,局域
 - **2.4** Windows 右键菜单(已实现 v0.6.0):`quickdrop install` 写注册表 `HKCU\Software\Classes\*\shell\QuickDrop\command`,值 `"C:\path\quickdrop.exe" send "%1"`。`uninstall` 删,`status` 看。用户级 (HKCU) 无需 UAC。**Win11 限制**:传统注册表方式在 Win11 下显示在 "显示更多选项" 里 (Shift+右键直达),顶级菜单需要 MSIX sparse package + IExplorerCommand (留 Phase 4,见 ADR-18)
 - **2.5** mDNS 广播 + 发现 PC 列表
 - **2.6** 设备记忆:JSON `~/.quickdrop/devices.json`
-- **2.7** Vue 3 工程化:`web/` 目录,vite 构建,产物用 `embed.FS` 打进 .exe
+- **2.7** Vue 3 工程化(已实现 v0.7.0):`web/` 目录 Vite + Vue3 + TS MPA (4 个独立入口对应 / /d /r /u 4 路由),Dashboard/Download/Receive/Upload.vue 替代 HTML 模板;构建产物 `web/dist/` 由 build.ps1 复制到 `cmd/quickdrop/web/` 用 `embed.FS` 打进 .exe;新增 `/api/info` JSON API 供 Vue 拉服务状态
 - **2.8** WebSocket 实时进度
 - **2.9** Windows toast 通知接收方
 - **2.10** 自有窗口替代浏览器(已落 v0.3.0 主体, **UI 待按 ADR-17 收尾**):WebView2 起 280×320 小窗加载 dashboard,删 Phase 1 临时打开浏览器代码。**UI 收尾**:换无边框、固定 ~280px 宽、只显示 **QR + 文件名 + 大小 + 关闭按钮**,不再加载 `/` 当前的完整页(里面有上传区块,违背 ADR-17)

@@ -19,9 +19,11 @@
 package main
 
 import (
+	"embed"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -34,6 +36,24 @@ import (
 	"quickdrop/internal/tray"
 	"quickdrop/internal/window"
 )
+
+// webDist 嵌入 Vite 构建产物. embed 路径不允许 ../, 所以 build.ps1 会先把
+// 仓库根 web/dist/ 复制到 cmd/quickdrop/web/, 再 go build.
+//
+//go:embed all:web
+var webDist embed.FS
+
+// distFS 是剥掉 "web/" 前缀后的 fs.FS, 直接以 dist 内容为根.
+var distFS fs.FS
+
+func init() {
+	sub, err := fs.Sub(webDist, "web")
+	if err != nil {
+		// 这只在 build 前没复制 web/ 时发生, 提示开发者
+		panic("embed web/ failed; build.ps1 应当先把 web/dist 复制到 cmd/quickdrop/web/: " + err.Error())
+	}
+	distFS = sub
+}
 
 const (
 	daemonURL = "http://127.0.0.1:8443"
@@ -277,6 +297,7 @@ func runDaemon(initialPath string, initialReceive bool) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	srv.SetDist(distFS)
 
 	selfExe, err := os.Executable()
 	if err != nil {

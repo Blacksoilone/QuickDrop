@@ -76,9 +76,9 @@ if ($lanIP -and $lanIP -ne "127.0.0.1") {
 }
 
 Write-Host ""
-Write-Host "=== Step 4: GET / 显示 test.png ===" -ForegroundColor Cyan
-$html1 = (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8443/).Content
-Check "主页含 'test.png'" ($html1 -match "test\.png")
+Write-Host "=== Step 4: /api/info 显示 test.png ===" -ForegroundColor Cyan
+$info = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8443/api/info | Select-Object -ExpandProperty Content | ConvertFrom-Json
+Check "/api/info fileName=test.png" ($info.fileName -eq "test.png")
 
 Write-Host ""
 Write-Host "=== Step 5: 第二次 send 走客户端模式 (切到中文名文件) ===" -ForegroundColor Cyan
@@ -89,10 +89,10 @@ Check "客户端退出码 0" ($client.ExitCode -eq 0)
 Check "客户端 < 3 秒返回 (实际 $($sw.ElapsedMilliseconds)ms)" ($sw.ElapsedMilliseconds -lt 3000)
 
 Write-Host ""
-Write-Host "=== Step 6: 主页应已切换 ===" -ForegroundColor Cyan
-$html2 = (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8443/).Content
-Check "主页切到 '你好世界.png'" ($html2 -match "你好世界\.png")
-Check "主页不再有 'test.png'" (-not ($html2 -match "<p class=`"name`">test\.png"))
+Write-Host "=== Step 6: /api/info 应已切换 ===" -ForegroundColor Cyan
+$info = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8443/api/info | Select-Object -ExpandProperty Content | ConvertFrom-Json
+Check "/api/info fileName=你好世界.png" ($info.fileName -eq "你好世界.png")
+Check "/api/info fileName 不再是 test.png" ($info.fileName -ne "test.png")
 
 Write-Host ""
 Write-Host "=== Step 7: /file disposition 也切换 ===" -ForegroundColor Cyan
@@ -104,8 +104,8 @@ Write-Host ""
 Write-Host "=== Step 8: 第三次 send 切回 test.png ===" -ForegroundColor Cyan
 $client3 = Start-Process -FilePath $exe -ArgumentList "send",$testPng -PassThru -WindowStyle Hidden -Wait
 Check "第三次 send 退出码 0" ($client3.ExitCode -eq 0)
-$html3 = (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8443/).Content
-Check "主页切回 test.png" ($html3 -match "test\.png")
+$info = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8443/api/info | Select-Object -ExpandProperty Content | ConvertFrom-Json
+Check "/api/info 切回 test.png" ($info.fileName -eq "test.png")
 
 Write-Host ""
 Write-Host "=== Step 9: daemon 经历 3 次切换仍存活 ===" -ForegroundColor Cyan

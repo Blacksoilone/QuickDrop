@@ -1,20 +1,19 @@
 // Package server hosts the QuickDrop HTTP routes
 // (/, /d, /r, /u, /file, /qr, /qr-recv, /upload) plus internal IPC routes
-// (/internal/health, /internal/send, /internal/receive).
+// (/internal/health, /internal/send, /internal/receive) and the JSON API
+// (/api/info) for the Vue 前端 (2.7).
 //
 // ADR-17 路由职责:
-//   /         电脑端发送模式 dashboard, 只渲 QR + 文件名/大小 + 关闭键
-//   /d        手机端发送目标页 (扫 /qr 进的是这里), 文件图标 + 信息 + 下载
-//   /qr       PNG QR, 编码 baseURL + /d (发送模式)
-//   /file     实际文件下载, http.ServeFile
-//   /r        电脑端接收模式 dashboard, 只渲 QR + 提示 + 停止接收键
-//   /u        手机端上传表单页 (扫 /qr-recv 进的是这里)
-//   /qr-recv  PNG QR, 编码 baseURL + /u (接收模式)
-//   /upload   实际接收上传, 默认 404 (ADR-17 安全约束), 由 EnableReceive(true) 开启
-//
-// 路由默认行为:
-//   发送/下载/QR 类路由: 没文件时 (纯接收模式启动) 返回 404, 防泄露
-//   /r /u /qr-recv:      不依赖文件, 始终可用 (但 /u 也受 receiveMode 门禁, 关时 404)
+//   /        电脑端发送 dashboard (Vue 渲染, GET 拉 /api/info), 只渲 QR + 文件名/大小 + 关闭键
+//   /d       手机端发送目标页 (Vue), 文件图标 + 信息 + 下载
+//   /qr      PNG QR, 编码 baseURL + /d (发送模式)
+//   /file    实际文件下载, http.ServeFile
+//   /r       电脑端接收 dashboard (Vue), QR + 提示 + 停止接收键
+//   /u       手机端上传表单 (Vue, 受 receiveMode 门禁)
+//   /qr-recv PNG QR, 编码 baseURL + /u (接收模式)
+//   /upload  实际接收上传, 默认 404 (ADR-17 安全约束), 由 EnableReceive(true) 开启
+//   /api/info JSON 服务状态, Vue 前端拉取
+//   /assets/* embed.FS 静态资源 (Vue chunk + CSS)
 //
 // 单进程 daemon 模式: 第一次 quickdrop send X 起 daemon, 后续 send Y 走 IPC
 // 切换当前发送文件, 命令行立即退出. 见 cmd/quickdrop/main.go.
@@ -22,9 +21,10 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"html"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -61,6 +61,10 @@ type Server struct {
 	uploadURL  string // 手机端上传 URL (接收模式 QR 编码)
 	baseURL    string // http://<lan>:8443
 	httpSrv    *http.Server
+
+	// dist 是 Vite 构建产物的 fs (含 index.html / d.html / r.html / u.html / assets/*).
+	// 由 cmd/quickdrop 通过 SetDist 注入 (因为 //go:embed 必须在 main 包里相对仓库根).
+	dist fs.FS
 
 	onSwap    func(newName string) // 文件被 SwapFile 切换后回调 (tray tooltip 用)
 	onReceive func(on bool)        // 接收模式切换后回调 (main 起/关 receive webview)
@@ -145,6 +149,13 @@ func (s *Server) SetOnReceive(fn func(on bool)) {
 	s.onReceive = fn
 }
 
+// SetDist 注入 Vite 构建产物 fs (含 index.html / d.html / r.html / u.html / assets/*).
+// 必须在 Start 之前调用. 由 cmd/quickdrop 提供, 因为 //go:embed 路径必须在
+// 引用它的包内相对存在, 而 web/dist 在仓库根.
+func (s *Server) SetDist(dist fs.FS) {
+	s.dist = dist
+}
+
 // SwapFile 把当前发送文件切换成 rawPath. 并发安全.
 // 用于 IPC: 第二次 quickdrop send Y 不重启进程, 直接更新这里.
 func (s *Server) SwapFile(rawPath string) error {
@@ -167,6 +178,9 @@ func (s *Server) SwapFile(rawPath string) error {
 // Start 在当前 goroutine 之外起 listener, 立刻返回. 出错通过 log.Fatalf 兜底.
 // 调用者通常: go server.Start() 然后让 main goroutine 跑 systray.
 func (s *Server) Start() {
+	if s.dist == nil {
+		log.Fatal("Server.Start: dist 未注入, 调用方必须先 SetDist")
+	}
 	cleanupStaleTmp()
 
 	mux := http.NewServeMux()
@@ -180,10 +194,14 @@ func (s *Server) Start() {
 	mux.HandleFunc("/r", s.handleReceiveDashboard)
 	mux.HandleFunc("/u", s.handleUploadForm)
 	mux.HandleFunc("/upload", s.handleUpload)
+	// JSON API (Vue 前端拉服务状态)
+	mux.HandleFunc("/api/info", s.handleAPIInfo)
 	// IPC (仅 127.0.0.1)
 	mux.HandleFunc("/internal/health", requireLocal(s.handleInternalHealth))
 	mux.HandleFunc("/internal/send", requireLocal(s.handleInternalSend))
 	mux.HandleFunc("/internal/receive", requireLocal(s.handleInternalReceive))
+	// 静态资源 (Vue chunks / CSS)
+	mux.Handle("/assets/", http.FileServer(http.FS(s.dist)))
 
 	s.httpSrv = &http.Server{Addr: ":8443", Handler: mux}
 
@@ -263,58 +281,82 @@ func (s *Server) handleQRRecv(w http.ResponseWriter, r *http.Request) {
 // handleIndex / : 电脑端发送模式 webview 弹窗加载.
 // 极简 dashboard: 只渲 QR + 当前文件名 + 大小 + 关闭按钮 (ADR-17).
 // 无文件时 404 (纯接收模式 daemon 没东西可展示).
+// handleIndex / : 电脑端发送模式 webview 弹窗加载.
+// 服务 web/dist/index.html (Vue 渲染骨架, 内容靠 JS 拉 /api/info).
+// 无文件时 404 (纯接收模式 daemon 没东西可展示).
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
-	s.mu.RLock()
-	name, size := s.fileName, s.fileSize
-	s.mu.RUnlock()
-	if name == "" {
+	if !s.HasFile() {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	fmt.Fprintf(w, dashboardHTMLTpl, html.EscapeString(name), html.EscapeString(size))
+	s.serveDistFile(w, r, "index.html")
 }
 
 // handleDownload /d : 手机端发送目标页 (扫码进的就是这里).
-// 文件图标 + 文件名 + 大小 + 下载按钮, 没有 QR (手机不需要给自己看).
+// 服务 web/dist/d.html.
 // 无文件时 404.
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	name, size := s.fileName, s.fileSize
-	s.mu.RUnlock()
-	if name == "" {
+	if !s.HasFile() {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	fmt.Fprintf(w, downloadHTMLTpl, html.EscapeString(name), html.EscapeString(size))
+	s.serveDistFile(w, r, "d.html")
 }
 
 // handleReceiveDashboard /r : 电脑端接收模式 webview 弹窗加载.
-// 只渲 接收 QR + 提示 + 停止接收键 (ADR-17). 始终可达, 不受 receiveMode 门禁,
-// 因为 main 在 EnableReceive(true) 之后才会让 webview 加载这个 URL.
+// 服务 web/dist/r.html. 始终可达, 不受 receiveMode 门禁.
 func (s *Server) handleReceiveDashboard(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Write([]byte(receiveDashboardHTMLTpl))
+	s.serveDistFile(w, r, "r.html")
 }
 
-// handleUploadForm /u : 手机端上传表单 (扫 /qr-recv 进的就是这里).
-// 受 receiveMode 门禁: 关时 404, 不暴露 "daemon 在跑但接收关了" 这条信息.
+// handleUploadForm /u : 手机端上传表单. 服务 web/dist/u.html.
+// 受 receiveMode 门禁: 关时 404.
 func (s *Server) handleUploadForm(w http.ResponseWriter, r *http.Request) {
 	if !s.receiveMode.Load() {
 		http.NotFound(w, r)
 		return
 	}
+	s.serveDistFile(w, r, "u.html")
+}
+
+// serveDistFile 从嵌入的 web/dist 读取文件, 加 no-store 防手机缓存看到旧文件名.
+func (s *Server) serveDistFile(w http.ResponseWriter, r *http.Request, name string) {
+	data, err := fs.ReadFile(s.dist, name)
+	if err != nil {
+		http.Error(w, "web 资源缺失: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Write([]byte(uploadHTMLTpl))
+	w.Write(data)
+}
+
+// serverInfo /api/info 返回的 JSON. 必须与 web/src/api.ts 的 ServerInfo 保持一致.
+type serverInfo struct {
+	FileName  string `json:"fileName"`
+	FileSize  string `json:"fileSize"`
+	HasFile   bool   `json:"hasFile"`
+	Receiving bool   `json:"receiving"`
+}
+
+// handleAPIInfo /api/info : Vue 前端拉服务状态 (当前文件 + 接收开关).
+func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	name, size, has := s.fileName, s.fileSize, s.absPath != ""
+	s.mu.RUnlock()
+	info := serverInfo{
+		FileName:  name,
+		FileSize:  size,
+		HasFile:   has,
+		Receiving: s.receiveMode.Load(),
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(info)
 }
 
 // handleInternalHealth: GET /internal/health
@@ -455,7 +497,11 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, uploadDoneHTMLTpl, count)
+	// Vue 的 Upload.vue 解析 "已收到 N 个文件" 拿数字, 保持文字契约.
+	// 后续可以换成纯 JSON, 现在用 HTML 让浏览器直接打开 /upload (非 Vue 场景) 也能看.
+	fmt.Fprintf(w, `<!doctype html><html lang="zh-CN"><meta charset="utf-8">`+
+		`<title>QuickDrop</title><body style="font-family:system-ui;text-align:center;padding:40px;">`+
+		`<h1>已收到 %d 个文件</h1><p>保存到 ~/Downloads/QuickDrop/</p></body></html>`, count)
 }
 
 // validateFile 把用户给的路径 (相对/绝对都行) 检查 + 描述化.

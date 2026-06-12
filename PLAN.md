@@ -22,10 +22,11 @@
 ## 2. 项目结构
 
 ```
-cmd/quickdrop/main.go         入口,window/recv/send 三子命令 + probeDaemon → client/daemon
-internal/server/server.go     HTTP server (Start/Shutdown/SwapFile/EnableReceive),
-                              路由含 /、/d、/r、/u、/file、/qr、/qr-recv、/upload、/internal/*
-internal/server/templates.go  HTML 模板 (4 套: 发送 dashboard / 下载 / 接收 dashboard / 上传)
+cmd/quickdrop/main.go         入口,window/recv/send/install/uninstall/status 子命令 + probeDaemon → client/daemon
+                              + //go:embed all:web (Vite 产物嵌入二进制)
+cmd/quickdrop/web/            (build 时由 build.ps1 从 web/dist 复制, 被 embed)
+internal/server/server.go     HTTP server (Start/Shutdown/SwapFile/EnableReceive/SetDist),
+                              路由含 /、/d、/r、/u、/file、/qr、/qr-recv、/upload、/api/info、/assets/*、/internal/*
 internal/qr/qr.go             QR PNG 渲染
 internal/tray/tray.go         systray, 菜单(复制链接/接收文件 checkbox/退出), UpdateTooltip + SetReceiveChecked
 internal/tray/icon.ico        托盘图标 16x16 (Windows systray 必须 ICO,不能 PNG)
@@ -33,12 +34,22 @@ internal/window/window.go     webview 子进程实际渲染函数 (runWebview, �
 internal/window/manager.go    daemon 持有的子进程管理器 + Mode + recvCmd (发送窗+接收窗独立)
 internal/installer/registry.go  Windows 右键菜单注册表读写 (HKCU 用户级,无需 UAC)
 internal/installer/msgbox.go    Win32 MessageBoxW 包装 (windowsgui 模式下唯一可视反馈)
-build.ps1                     一键构建脚本
+web/                          Vite + Vue3 + TS 前端工程
+web/package.json              依赖 vue/vite/vue-tsc
+web/vite.config.ts            MPA 4 入口 + dev proxy 转 :8443
+web/index.html /d.html /r.html /u.html  4 个页面入口 (对应 server.go 4 路由)
+web/src/pages/Dashboard.vue   电脑端发送窗 (拉 /api/info, 渲 QR + 名 + 大小 + 关闭)
+web/src/pages/Download.vue    手机端发送目标页 (文件图标 + 信息 + 下载)
+web/src/pages/Receive.vue     电脑端接收窗 (QR + 提示 + 停止接收)
+web/src/pages/Upload.vue      手机端上传表单
+web/src/api.ts                fetchInfo / stopReceiving / closeWindow 类型安全
+web/src/style.css             全局基础样式 (色彩/字体/.btn/暗色模式)
+build.ps1                     一键构建脚本 (Vue build → 复制 → Go build)
 test/prepare-fixtures.ps1     生成 500MB big.bin + 你好世界.png 验收固件
 test/test-crash-cleanup.ps1   验收用例 5 自动化 (中途崩溃 → 重启清理)
-test/test-daemon-switch.ps1   Phase 2.2+2.3 验收: daemon 健康检查 / 客户端 IPC 切换
+test/test-daemon-switch.ps1   Phase 2.2+2.3 验收: daemon 健康检查 / 客户端 IPC 切换 (改测 /api/info)
 test/test-window.ps1          Phase 2.10 验收: webview 子进程 + 三种 window-mode
-test/test-routes.ps1          Phase 2.11 + 2.10 UI 验收: ADR-17 路由语义
+test/test-routes.ps1          Phase 2.11 + 2.7 UI 验收: Vue 骨架 + /api/info JSON
 test/test-receive.ps1         Phase 2.13 验收: 接收模式独立入口 + /u 状态切换 + 上传落盘
 test/test-install.ps1         Phase 2.4 验收: 注册表 install/uninstall/status + 幂等
 TEST.md                       Phase 1 验收清单 (手动 + 自动)
@@ -46,6 +57,12 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 
 **环境变量**:
 - `QUICKDROP_WINDOW_MODE=replace|keep|first-only` 控制 daemon 弹窗策略,默认 replace
+
+**前端开发**:
+```powershell
+cd web
+npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 8443 daemon
+```
 
 ## 3. 已完成
 
@@ -87,6 +104,16 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
   - windowsgui 模式下用 Win32 MessageBoxW 给安装结果反馈; `-q` 静默给脚本测试用
   - test-install.ps1 18 checks ALL PASS (写入/幂等/状态/卸载/卸载幂等/路径含引号)
   - **真正的核心交互**: 右键文件 → "通过 QuickDrop 发送" → 1 秒内弹 QR 窗
+- [x] **任务 2.7 Vue 工程化**:
+  - `web/` 完整 Vite + Vue3 + TypeScript MPA 工程, 4 个独立入口对应 4 路由
+  - `web/src/pages/{Dashboard,Download,Receive,Upload}.vue` 替代原 HTML 模板字符串
+  - `web/src/api.ts` 类型安全包装 fetchInfo / stopReceiving / closeWindow
+  - server 新增 `/api/info` JSON API + `/assets/*` 静态资源 (来自嵌入的 dist)
+  - `cmd/quickdrop` 用 `//go:embed all:web` 嵌入 Vite 产物 (build.ps1 自动从 web/dist 复制过去)
+  - build.ps1 增加 Vue build 前置 (-SkipWeb 可跳过), npm 镜像换 npmmirror
+  - 删除旧 internal/server/templates.go (268 行) 与所有 fmt.Fprintf HTML 拼接逻辑
+  - 5 个回归测试脚本全 PASS (test-routes 改测 Vue 骨架 + /api/info; test-daemon-switch 改测 /api/info)
+  - **开发体验飞跃**: `cd web && npm run dev` 起 5173, /api+/qr+/file+/upload 自动 proxy 到 8443 daemon, 热重载
 
 ## 4. 遇到的问题
 
@@ -107,14 +134,15 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 
 按 [QuickDrop.md §6 Phase 2](./QuickDrop.md):
 
-- **2.7 Vue 工程化**: 路由已稳 (`/`、`/d`、`/r`、`/u`),可上 Vue 重写模板,把 dashboard / 下载 / 接收 三套页用组件化重构
 - **2.5 + 2.6** mDNS 发现 PC + 设备记忆: 发送时除手机扫码外,可点列表里的 PC 直接发
 - **2.8 + 2.9** WebSocket 进度 + Windows toast: 实时进度条 + 接收方桌面通知
+- **Phase 3 起步**: HTTPS via lancert.dev + PWA manifest, 真机适配开始
 
 ### 待补验收
 
 - ⏸ TEST.md 用例 6 多手机并发(等借到第二台手机)
 - ⏸ Win11 实地复核右键菜单显示位置 (Shift+右键 / "显示更多选项")
+- ⏸ Vue 页面在真手机浏览器渲染 (UA 测试, 主要是 iOS Safari 兼容)
 
 ### 后续 Phase 2 才做的小项
 
@@ -123,3 +151,4 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 - `QUICKDROP_WINDOW_MODE` 配置项最终应进配置页 UI (现在只能 env 设置)
 - 接收完成后自动关闭接收模式 (现在要用户手动点"停止接收"或托盘取消勾,有可能忘了一直开着)
 - Win11 现代右键菜单 (顶级显示, 不需 Shift): 需要 MSIX sparse package + IExplorerCommand,工程量大,留 Phase 4
+- 文件切换后 webview 旧窗内容不会自动刷新 (用户得 F5 / 重开窗才看到新文件名),等 2.8 WebSocket 解决

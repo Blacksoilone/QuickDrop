@@ -38,21 +38,27 @@ if ($daemon.HasExited) {
 }
 
 Write-Host ""
-Write-Host "=== / dashboard: 只能有 QR + 文件名 + 大小 + 关闭键, 无下载/上传 ===" -ForegroundColor Cyan
+Write-Host "=== / dashboard: Vue 骨架 + 静态资源引用, 无下载/上传内联 ===" -ForegroundColor Cyan
 $html = (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8443/).Content
-Check "/ 含 <img src=`"/qr`">" ($html -match '<img src="/qr"')
-Check "/ 含文件名 test.png" ($html -match 'test\.png')
-Check "/ 无 href=`"/file`" (电脑端不下载给自己)" (-not ($html -match 'href="/file"'))
-Check "/ 无 <form action=`"/upload`"> (电脑端无上传)" (-not ($html -match '<form action="/upload"'))
-Check "/ 含关闭按钮 (quickdropClose)" ($html -match 'quickdropClose')
+Check "/ 含 Vue 挂载点 #app" ($html -match 'id="app"')
+Check "/ 引用 /assets/index-*.js (Vue chunk)" ($html -match '/assets/index-')
+Check "/ 不含 href=`"/file`" 内联 (Vue 端点动态绑定)" (-not ($html -match 'href="/file"'))
+Check "/ 不含 <form action=`"/upload`">" (-not ($html -match '<form action="/upload"'))
 
 Write-Host ""
-Write-Host "=== /d 手机端发送页: 文件图标 + 信息 + 下载, 无 QR ===" -ForegroundColor Cyan
+Write-Host "=== /api/info: JSON 当前状态 ===" -ForegroundColor Cyan
+$info = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8443/api/info | Select-Object -ExpandProperty Content | ConvertFrom-Json
+Check "/api/info 含 fileName=test.png" ($info.fileName -eq "test.png")
+Check "/api/info hasFile=true" ($info.hasFile -eq $true)
+Check "/api/info receiving=false (默认)" ($info.receiving -eq $false)
+Check "/api/info fileSize 非空" (-not [string]::IsNullOrEmpty($info.fileSize))
+
+Write-Host ""
+Write-Host "=== /d 手机端发送页: Vue 骨架, 无内联 QR ===" -ForegroundColor Cyan
 $html = (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8443/d).Content
-Check "/d 含 href=`"/file`" 下载按钮" ($html -match 'href="/file"')
-Check "/d 无 <img src=`"/qr`"> (手机不需要给自己看 QR)" (-not ($html -match '<img src="/qr"'))
-Check "/d 无 <form action=`"/upload`">" (-not ($html -match '<form action="/upload"'))
-Check "/d 含文件名 test.png" ($html -match 'test\.png')
+Check "/d 含 #app" ($html -match 'id="app"')
+Check "/d 引用 /assets/d-*.js" ($html -match '/assets/d-')
+Check "/d 不含 <img src=`"/qr`"> (Vue 端点不渲 QR)" (-not ($html -match '<img src="/qr"'))
 
 Write-Host ""
 Write-Host "=== /upload 默认 404 (ADR-17 安全约束) ===" -ForegroundColor Cyan
