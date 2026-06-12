@@ -35,6 +35,7 @@ import (
 	"quickdrop/internal/discovery"
 	"quickdrop/internal/identity"
 	"quickdrop/internal/installer"
+	"quickdrop/internal/peer"
 	"quickdrop/internal/server"
 	"quickdrop/internal/tray"
 	"quickdrop/internal/window"
@@ -323,6 +324,8 @@ func runDaemon(initialPath string, initialReceive bool) {
 		log.Fatal(err)
 	}
 	srv.SetDist(distFS)
+	srv.SetIdentity(ident.UUID, ident.Name)
+	srv.SetPeerManager(peerMgrAdapter{peer.NewManager()})
 
 	// mDNS: 广播自己 + 发现局域网内其他 QuickDrop. 失败不致命.
 	disc, err := discovery.Start(ident.UUID, ident.Name, version, port)
@@ -413,6 +416,75 @@ func (a peerAdapter) Peers() []*server.Peer {
 	}
 	return out
 }
+
+// peerMgrAdapter 把 internal/peer.Manager 适配成 server.PeerManager.
+// server 接口签名是扁平参数, peer.Manager 内部用 struct, 这里做转换.
+// 不在 peer 包加扁平方法是因为 peer 包用 struct 更自然.
+type peerMgrAdapter struct{ m *peer.Manager }
+
+func (a peerMgrAdapter) CreateOutgoing(to server.PeerInfo, absPath, fileName string, fileSize int64) (string, error) {
+	o, _, err := a.m.CreateOutgoing(peer.PeerInfo{
+		UUID: to.UUID, Name: to.Name, Host: to.Host, IPv4: to.IPv4, Port: to.Port,
+	}, absPath, fileName, fileSize)
+	if err != nil {
+		return "", err
+	}
+	return o.Token, nil
+}
+
+func (a peerMgrAdapter) LookupOutgoing(token string) (absPath, fileName string, ok bool) {
+	o, ok := a.m.LookupOutgoing(token)
+	if !ok {
+		return "", "", false
+	}
+	return o.AbsPath, o.FileName, true
+}
+
+func (a peerMgrAdapter) MarkDelivered(token string) { a.m.MarkDelivered(token) }
+
+func (a peerMgrAdapter) AddPending(token, fromUUID, fromName, fromHost, fromIPv4 string, fromPort int, fileName string, fileSize int64) error {
+	return a.m.AddPending(peer.Incoming{
+		Token: token,
+		From: peer.PeerInfo{
+			UUID: fromUUID, Name: fromName, Host: fromHost, IPv4: fromIPv4, Port: fromPort,
+		},
+		FileName: fileName,
+		FileSize: fileSize,
+	})
+}
+
+func (a peerMgrAdapter) LookupPending(token string) (fromIPv4 string, fromPort int, fileName string, fileSize int64, ok bool) {
+	p := a.m.LookupPending(token)
+	if p == nil {
+		return "", 0, "", 0, false
+	}
+	return p.From.IPv4, p.From.Port, p.FileName, p.FileSize, true
+}
+
+func (a peerMgrAdapter) SetPendingState(token, state string) bool {
+	return a.m.SetPendingState(token, peer.State(state))
+}
+
+func (a peerMgrAdapter) PendingList() []server.PendingEntry {
+	src := a.m.PendingList()
+	out := make([]server.PendingEntry, len(src))
+	for i, p := range src {
+		out[i] = server.PendingEntry{
+			Token: p.Token,
+			State: string(p.State),
+			From: server.Peer{
+				UUID: p.From.UUID, Name: p.From.Name, Host: p.From.Host,
+				IPv4: []string{p.From.IPv4}, Port: p.From.Port,
+			},
+			FileName: p.FileName,
+			FileSize: p.FileSize,
+			ArriveAt: p.ArriveAt.Unix(),
+		}
+	}
+	return out
+}
+
+func (a peerMgrAdapter) PendingCount() int { return a.m.PendingCount() }
 
 func setupLogging() {
 	logPath := filepath.Join(os.TempDir(), "quickdrop.log")

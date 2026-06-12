@@ -122,6 +122,19 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
   - QUICKDROP_PORT env 覆盖默认 8443 (probeDaemon 同步使用同一端口, 支持同机多 daemon 测试)
   - test-discovery.ps1 13 checks ALL PASS (mDNS 广播注册 / UUID 持久化跨重启 / 端口隔离 / 过滤自身)
   - **限制**: grandcat/zeroconf v1.0 默认不走 loopback (PR #68 待合), 同机两 daemon 互不可见; 真实 PC→PC 测试需要第二台 Windows PC
+- [x] **任务 2.5b PC↔PC IPC 协议** (ADR-17 安全约束):
+  - 新包 `internal/peer`: Manager 持有 outgoing (Sender) + pending (Receiver) 两个状态机
+    - Token 32 字符 hex (16 字节随机), 同时是 transferID + 鉴权
+    - 一次性: Pull 成功后 MarkDelivered, 同 token 重 Pull 立即 404 (防重放)
+    - 30 分钟未决策自动 expire, 5 分钟 GC delivered (防内存堆积)
+  - server 新增 4 个 peer 路由:
+    - POST `/peer/incoming` (来自其他 daemon): 入 pending queue
+    - GET `/peer/file?token=xxx` (鉴权 Pull): token 匹配才 ServeFile, 否则 404
+    - POST `/internal/peer-send` (Alice IPC): 创建 outgoing + POST 对端 /peer/incoming
+      支持 toUUID (mDNS 查) 或 toIPv4+toPort (直连旁路, 测试用)
+    - POST `/internal/peer-decide` (Bob IPC): accept → 异步 Pull, reject → 改状态
+  - server 新增 GET `/api/pending` Vue 端拉待决策列表
+  - test-peer.ps1 21 checks ALL PASS (双 daemon Alice→Bob 全流程: 邀请/接受/Pull/MD5 一致/token 一次性/reject)
 
 ## 4. 遇到的问题
 
@@ -138,13 +151,12 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
 
 ## 5. 待办
 
-### 下一步 — 继续推 2.5b–e (PC→PC 互传剩余部分)
+### 下一步 — 继续推 2.5c–e + 2.6
 
 按 [QuickDrop.md §6 Phase 2.5](./QuickDrop.md):
 
-- **2.5b** PC→PC IPC: `/peer/incoming` 接收元数据 + pending queue + `/peer/file?id=xxx` 鉴权下载
 - **2.5c** Toast 通知 (ADR-19): `go-toast` 弹按钮 toast, install 注册 `quickdrop://` URL scheme
-- **2.5d** `quickdrop accept --id` / `reject --id` 子命令: URL 触发 → Pull 文件
+- **2.5d** `quickdrop accept --id` / `reject --id` 子命令: URL 触发 → 调 /internal/peer-decide
 - **2.5e** 红点 fallback: 托盘菜单 "待处理 (N)" + `/pending` Vue 页面
 
 完成后下一步是 **2.6 设备记忆 + 信任升级**: `~/.quickdrop/devices.json` + "信任此设备" 复选框.

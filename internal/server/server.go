@@ -71,6 +71,15 @@ type Server struct {
 	// nil 时 /api/peers 返回空数组. 由 SetPeerSource 注入.
 	peerSource PeerSource
 
+	// peers 管理 PC↔PC 文件传输状态 (Outgoing + Pending).
+	// 由 SetPeerManager 注入. nil 时 /peer/* 路由全 404.
+	peers PeerManager
+
+	// myIdentity 本机身份 (UUID + 显示名), 给 /peer/incoming 时填 from 字段用.
+	// 由 SetIdentity 注入.
+	myUUID string
+	myName string
+
 	onSwap    func(newName string) // 文件被 SwapFile 切换后回调 (tray tooltip 用)
 	onReceive func(on bool)        // 接收模式切换后回调 (main 起/关 receive webview)
 }
@@ -78,6 +87,41 @@ type Server struct {
 // PeerSource 注入接口, server 通过它拉发现到的对端列表 (避免 server 直接依赖 discovery 包).
 type PeerSource interface {
 	Peers() []*Peer
+}
+
+// PeerManager 注入接口, server 通过它操作 PC↔PC 传输状态 (Outgoing/Pending).
+// 实际实现是 internal/peer.Manager, 这里抽 interface 避免引入循环依赖 +
+// 让 server.go 不依赖具体实现.
+type PeerManager interface {
+	// Sender 端
+	CreateOutgoing(to PeerInfo, absPath, fileName string, fileSize int64) (token string, err error)
+	LookupOutgoing(token string) (absPath, fileName string, ok bool)
+	MarkDelivered(token string)
+	// Receiver 端
+	AddPending(token, fromUUID, fromName, fromHost, fromIPv4 string, fromPort int, fileName string, fileSize int64) error
+	LookupPending(token string) (fromIPv4 string, fromPort int, fileName string, fileSize int64, ok bool)
+	SetPendingState(token, state string) bool
+	PendingList() []PendingEntry
+	PendingCount() int
+}
+
+// PeerInfo 与 internal/peer.PeerInfo 同结构, server 包独立定义避免循环.
+type PeerInfo struct {
+	UUID string
+	Name string
+	Host string
+	IPv4 string
+	Port int
+}
+
+// PendingEntry 给 /api/pending 用的快照.
+type PendingEntry struct {
+	Token    string `json:"token"`
+	State    string `json:"state"`
+	From     Peer   `json:"from"`
+	FileName string `json:"fileName"`
+	FileSize int64  `json:"fileSize"`
+	ArriveAt int64  `json:"arriveAt"` // Unix 秒
 }
 
 // Peer 与 internal/discovery.Peer 字段同名同义, 为了 server → JSON 转换不引入循环依赖,
@@ -189,6 +233,19 @@ func (s *Server) SetPeerSource(src PeerSource) {
 	s.peerSource = src
 }
 
+// SetPeerManager 注入 PC↔PC 传输状态机 (来自 internal/peer.Manager).
+// 必须在 Start 之前调用. 不调用时 /peer/* 路由全 404.
+func (s *Server) SetPeerManager(pm PeerManager) {
+	s.peers = pm
+}
+
+// SetIdentity 注入本机身份, 用于 POST /peer/incoming 时填 from 字段.
+// 必须在 Start 之前调用.
+func (s *Server) SetIdentity(uuid, name string) {
+	s.myUUID = uuid
+	s.myName = name
+}
+
 // SwapFile 把当前发送文件切换成 rawPath. 并发安全.
 // 用于 IPC: 第二次 quickdrop send Y 不重启进程, 直接更新这里.
 func (s *Server) SwapFile(rawPath string) error {
@@ -230,10 +287,16 @@ func (s *Server) Start() {
 	// JSON API (Vue 前端拉服务状态)
 	mux.HandleFunc("/api/info", s.handleAPIInfo)
 	mux.HandleFunc("/api/peers", s.handleAPIPeers)
+	mux.HandleFunc("/api/pending", s.handleAPIPending)
+	// PC↔PC peer 传输 (来自其他 daemon)
+	mux.HandleFunc("/peer/incoming", s.handlePeerIncoming)
+	mux.HandleFunc("/peer/file", s.handlePeerFile)
 	// IPC (仅 127.0.0.1)
 	mux.HandleFunc("/internal/health", requireLocal(s.handleInternalHealth))
 	mux.HandleFunc("/internal/send", requireLocal(s.handleInternalSend))
 	mux.HandleFunc("/internal/receive", requireLocal(s.handleInternalReceive))
+	mux.HandleFunc("/internal/peer-send", requireLocal(s.handleInternalPeerSend))
+	mux.HandleFunc("/internal/peer-decide", requireLocal(s.handleInternalPeerDecide))
 	// 静态资源 (Vue chunks / CSS)
 	mux.Handle("/assets/", http.FileServer(http.FS(s.dist)))
 
@@ -403,6 +466,280 @@ func (s *Server) handleAPIPeers(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(peers)
+}
+
+// handleAPIPending /api/pending : Vue 前端拉待决策的 incoming 列表.
+// 给 2.5e 的红点 UI / pending 列表页用.
+func (s *Server) handleAPIPending(w http.ResponseWriter, r *http.Request) {
+	list := []PendingEntry{}
+	if s.peers != nil {
+		list = s.peers.PendingList()
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(list)
+}
+
+// handlePeerIncoming POST /peer/incoming : 来自其他 daemon 的发送邀请.
+// body = JSON { token, from: {uuid,name,host,ipv4,port}, fileName, fileSize }
+// 入待决策队列, 等用户 (toast/Vue/CLI) 接受或拒绝.
+func (s *Server) handlePeerIncoming(w http.ResponseWriter, r *http.Request) {
+	if s.peers == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "需要 POST", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Token string `json:"token"`
+		From  struct {
+			UUID string `json:"uuid"`
+			Name string `json:"name"`
+			Host string `json:"host"`
+			IPv4 string `json:"ipv4"`
+			Port int    `json:"port"`
+		} `json:"from"`
+		FileName string `json:"fileName"`
+		FileSize int64  `json:"fileSize"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4*1024)).Decode(&body); err != nil {
+		http.Error(w, "解析 body 失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.Token == "" || body.From.UUID == "" || body.FileName == "" {
+		http.Error(w, "token/from.uuid/fileName 不能为空", http.StatusBadRequest)
+		return
+	}
+	if err := s.peers.AddPending(body.Token, body.From.UUID, body.From.Name, body.From.Host, body.From.IPv4, body.From.Port, body.FileName, body.FileSize); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	log.Printf("收到 peer 邀请: %s 想发 %s (%d 字节) token=%s", body.From.Name, body.FileName, body.FileSize, body.Token[:8])
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("queued"))
+}
+
+// handlePeerFile GET /peer/file?token=xxx : Bob 接受邀请后 Pull 文件.
+// token 验证: 匹配 outgoing 才回, 否则 404 (不暴露存在性, ADR-17 安全约束延伸到 peer).
+// 一次性: ServeFile 完成后 MarkDelivered, 再来同 token 会 404.
+func (s *Server) handlePeerFile(w http.ResponseWriter, r *http.Request) {
+	if s.peers == nil {
+		http.NotFound(w, r)
+		return
+	}
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.NotFound(w, r)
+		return
+	}
+	absPath, fileName, ok := s.peers.LookupOutgoing(token)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Disposition", contentDisposition(fileName))
+	http.ServeFile(w, r, absPath)
+	// ServeFile 完成 (或 client 提前断开) 后标记交付; 下次同 token 失效.
+	// 真正"交付完成"无法 100% 知 (HTTP 不可靠), 但 token 一次性即可防重放.
+	s.peers.MarkDelivered(token)
+	log.Printf("peer Pull 完成: token=%s file=%s", token[:8], fileName)
+}
+
+// handleInternalPeerSend POST /internal/peer-send : Alice 端 CLI/Vue 触发发文件给指定对端.
+// body = JSON { toUUID, filePath } (mDNS 路径), 或 { toIPv4, toPort, filePath } (直连旁路)
+// 步骤: 1) 找对端坐标  2) CreateOutgoing 拿 token  3) POST 到对端 /peer/incoming
+//       4) 返回 token 给客户端
+//
+// 直连旁路: 单机测试时 mDNS 不工作 (grandcat/zeroconf 默认不走 loopback),
+// 允许直接传 toIPv4+toPort 跳过对端发现. 此时 toUUID 不必填.
+// 仅 127.0.0.1.
+func (s *Server) handleInternalPeerSend(w http.ResponseWriter, r *http.Request) {
+	if s.peers == nil {
+		http.Error(w, "peer 子系统未启用", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "需要 POST", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		ToUUID   string `json:"toUUID"`
+		ToIPv4   string `json:"toIPv4"`
+		ToPort   int    `json:"toPort"`
+		FilePath string `json:"filePath"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&body); err != nil {
+		http.Error(w, "解析 body 失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.FilePath == "" {
+		http.Error(w, "filePath 不能为空", http.StatusBadRequest)
+		return
+	}
+
+	// 解析对端坐标: 优先 mDNS UUID 查找, 失败回退到 toIPv4/toPort
+	var (
+		targetIPv4 string
+		targetPort int
+		targetUUID string
+		targetName string
+		targetHost string
+	)
+	if body.ToUUID != "" && s.peerSource != nil {
+		for _, p := range s.peerSource.Peers() {
+			if p.UUID == body.ToUUID && len(p.IPv4) > 0 {
+				targetIPv4 = p.IPv4[0]
+				targetPort = p.Port
+				targetUUID = p.UUID
+				targetName = p.Name
+				targetHost = p.Host
+				break
+			}
+		}
+	}
+	if targetIPv4 == "" {
+		// 回退: 直连参数
+		if body.ToIPv4 == "" || body.ToPort == 0 {
+			http.Error(w, "对端未发现 (mDNS) 且未提供 toIPv4/toPort 直连参数", http.StatusNotFound)
+			return
+		}
+		targetIPv4 = body.ToIPv4
+		targetPort = body.ToPort
+		targetUUID = body.ToUUID // 可能空
+		targetName = fmt.Sprintf("%s:%d", body.ToIPv4, body.ToPort)
+	}
+
+	// 验证本地文件
+	absPath, fileName, _, err := validateFile(body.FilePath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	info, _ := os.Stat(absPath)
+
+	// 创建 outgoing + 拿 token
+	token, err := s.peers.CreateOutgoing(PeerInfo{
+		UUID: targetUUID, Name: targetName, Host: targetHost,
+		IPv4: targetIPv4, Port: targetPort,
+	}, absPath, fileName, info.Size())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// POST 给对端 /peer/incoming
+	incomingBody, _ := json.Marshal(map[string]any{
+		"token": token,
+		"from": map[string]any{
+			"uuid": s.myUUID, "name": s.myName,
+			"host": "",
+			"ipv4": getLANIP(),
+			"port": s.port,
+		},
+		"fileName": fileName,
+		"fileSize": info.Size(),
+	})
+	peerURL := fmt.Sprintf("http://%s:%d/peer/incoming", targetIPv4, targetPort)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post(peerURL, "application/json", strings.NewReader(string(incomingBody)))
+	if err != nil {
+		http.Error(w, "通知对端失败: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		http.Error(w, fmt.Sprintf("对端拒绝 %d: %s", resp.StatusCode, strings.TrimSpace(string(rb))), http.StatusBadGateway)
+		return
+	}
+
+	log.Printf("已通知 %s 准备接收 %s (token=%s)", targetName, fileName, token[:8])
+	resp200JSON(w, map[string]string{"token": token, "to": targetName})
+}
+
+// handleInternalPeerDecide POST /internal/peer-decide : Bob 端 toast/CLI/Vue 决策.
+// body = JSON { token, decision: "accept"|"reject" }
+// accept → 异步 GET http://from/peer/file?token=xxx 流式存到 Downloads/QuickDrop/
+// reject → 改 pending 状态, 不通知对端 (对端等 outgoing TTL 自然清掉)
+// 仅 127.0.0.1.
+func (s *Server) handleInternalPeerDecide(w http.ResponseWriter, r *http.Request) {
+	if s.peers == nil {
+		http.Error(w, "peer 子系统未启用", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "需要 POST", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Token    string `json:"token"`
+		Decision string `json:"decision"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body); err != nil {
+		http.Error(w, "解析 body 失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.Decision != "accept" && body.Decision != "reject" {
+		http.Error(w, `decision 必须是 "accept" 或 "reject"`, http.StatusBadRequest)
+		return
+	}
+
+	fromIPv4, fromPort, fileName, fileSize, ok := s.peers.LookupPending(body.Token)
+	if !ok {
+		http.Error(w, "token 未找到 (可能已过期)", http.StatusNotFound)
+		return
+	}
+
+	if body.Decision == "reject" {
+		s.peers.SetPendingState(body.Token, "rejected")
+		log.Printf("拒绝 peer 邀请 token=%s file=%s", body.Token[:8], fileName)
+		resp200JSON(w, map[string]string{"decision": "rejected"})
+		return
+	}
+
+	// accept: 异步 Pull
+	s.peers.SetPendingState(body.Token, "accepted")
+	go s.pullPeerFile(body.Token, fromIPv4, fromPort, fileName, fileSize)
+	resp200JSON(w, map[string]string{"decision": "accepted", "pulling": "started"})
+}
+
+// pullPeerFile 主动 GET 发送方的 /peer/file?token=xxx, 流式写到 Downloads/QuickDrop/.
+// 失败只打日志, 不重试 (用户可以再次 send).
+func (s *Server) pullPeerFile(token, fromIPv4 string, fromPort int, fileName string, fileSize int64) {
+	url := fmt.Sprintf("http://%s:%d/peer/file?token=%s", fromIPv4, fromPort, token)
+	client := &http.Client{Timeout: 30 * time.Minute} // 大文件慢传可能久
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Printf("Pull peer 文件失败 (token=%s): %v", token[:8], err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Pull peer 文件返回 %d (token=%s)", resp.StatusCode, token[:8])
+		return
+	}
+
+	dir, err := downloadsDir()
+	if err != nil {
+		log.Printf("Pull 失败 - 创建目录: %v", err)
+		return
+	}
+	safeName := filepath.Base(fileName)
+	finalPath := filepath.Join(dir, safeName)
+	tmpPath := finalPath + ".tmp"
+	if err := saveStream(tmpPath, finalPath, resp.Body); err != nil {
+		log.Printf("Pull 写入失败 (token=%s): %v", token[:8], err)
+		return
+	}
+	log.Printf("Pull peer 完成: %s (%d 字节)", finalPath, fileSize)
+}
+
+func resp200JSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 // handleInternalHealth: GET /internal/health
