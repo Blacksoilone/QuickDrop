@@ -65,6 +65,8 @@ func (s *Server) HomeURL() string { return s.homeURL }
 // Start 在当前 goroutine 之外起 listener, 立刻返回. 出错通过 log.Fatalf 兜底.
 // 调用者通常: go server.Start() 然后让 main goroutine 跑 systray.
 func (s *Server) Start() {
+	cleanupStaleTmp()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/file", s.handleFile)
 	mux.HandleFunc("/qr", s.handleQR)
@@ -219,6 +221,38 @@ func downloadsDir() (string, error) {
 		return "", fmt.Errorf("创建 %s: %w", dir, err)
 	}
 	return dir, nil
+}
+
+// cleanupStaleTmp 删除 Downloads/QuickDrop 下上次进程异常退出留下的 *.tmp.
+// 正常路径 saveStream 写完会 rename, 不会留 tmp; 但 -F 强杀或 OS 崩溃会留半截文件.
+// 启动时清扫一次, 避免越攒越多 + 用户疑惑. 失败不致命, 打日志继续.
+func cleanupStaleTmp() {
+	dir, err := downloadsDir()
+	if err != nil {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	n := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if !strings.HasSuffix(e.Name(), ".tmp") {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		if err := os.Remove(path); err != nil {
+			log.Printf("清理残留 tmp %s 失败: %v", path, err)
+			continue
+		}
+		n++
+	}
+	if n > 0 {
+		log.Printf("启动清理: 删除 %d 个残留 *.tmp", n)
+	}
 }
 
 func humanSize(n int64) string {

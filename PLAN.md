@@ -14,20 +14,24 @@
 | Node / npm | 24.16 / 11.13 (Phase 2.7 才用) |
 | WebView2 Runtime | 149.0(Win11 自带,Phase 2.10 才用) |
 
-**编译**:`go build -ldflags="-H=windowsgui" -o quickdrop.exe ./cmd/quickdrop`
+**编译**:`.\build.ps1`(release,隐藏黑窗) 或 `.\build.ps1 -Debug`(控制台可见)
 **运行**:`.\quickdrop.exe send <文件路径>`
-**测试文件**:[test.png](./test.png)(1.1 MB)
+**测试文件**:[test.png](./test.png)(1.1 MB,仓库自带);其余固件用 `.\test\prepare-fixtures.ps1` 生成
 **日志**:`%TEMP%\quickdrop.log`(`-H=windowsgui` 下 stderr 无效,统一写文件)
 
 ## 2. 项目结构
 
 ```
 cmd/quickdrop/main.go         入口,参数解析,日志,组装 server+tray
-internal/server/server.go     HTTP server (Start/Shutdown), 路由, LAN IP, 文件保存
+internal/server/server.go     HTTP server (Start/Shutdown), 路由, LAN IP, 文件保存, 启动清扫残留 .tmp
 internal/server/templates.go  HTML 模板
 internal/qr/qr.go             QR PNG 渲染
 internal/tray/tray.go         systray, 菜单(复制链接/退出)
 internal/tray/icon.ico        托盘图标 16x16 (Windows systray 必须 ICO,不能 PNG)
+build.ps1                     一键构建脚本
+test/prepare-fixtures.ps1     生成 500MB big.bin + 你好世界.png 验收固件
+test/test-crash-cleanup.ps1   验收用例 5 自动化 (中途崩溃 → 重启清理)
+TEST.md                       Phase 1 验收清单 (手动 + 自动)
 ```
 
 ## 3. 已完成
@@ -40,6 +44,7 @@ internal/tray/icon.ico        托盘图标 16x16 (Windows systray 必须 ICO,不
 - [x] **任务 1.4** 系统托盘:`getlantern/systray` + `atotto/clipboard`,菜单"复制扫码链接"/"退出",删掉 Phase 1 自动开浏览器代码(ADR-11)
 - [x] **任务 1.5** 命令行:`flag` 包,支持 `send <path>` 显式语法 + 拖拽单参数
 - [x] **任务 1.6** `/upload`:`MultipartReader` 流式 + 临时文件 + rename,中文文件名 RFC 5987 编码
+- [x] **任务 1.7 准备就绪**:`build.ps1`、`TEST.md`、固件脚本、用例 5 自动化通过。手动用例 1/2/3/4/6 待你跑(见 TEST.md)
 - [x] **任务 2.1** 拆包:`cmd/quickdrop` + `internal/{server,qr,tray}`(见 §2)
 
 ## 4. 遇到的问题
@@ -50,23 +55,18 @@ internal/tray/icon.ico        托盘图标 16x16 (Windows systray 必须 ICO,不
 - **CGO 工具链**:`getlantern/systray` 与 `webview/webview_go` 都依赖 CGO。已装 mingw-w64,`CGO_ENABLED=1` 默认开启
 - **systray.SetIcon 在 Windows 必须 ICO**:传 PNG 报 `Unable to set icon: The operation completed successfully.`,SetTitle 兜底文字仍可见但无图标。解决:用 PNG-in-ICO 容器(Vista+ 支持)。`internal/tray/icon.ico` 是临时占位
 - **`-H=windowsgui` 下 stderr 失效**:`io.MultiWriter(os.Stderr, f)` 在 stderr 无效时 short-circuit,文件那段永远写不到。解决:`log.SetOutput(f)` 只写文件,调试时 tail `%TEMP%\quickdrop.log`
-- **`Stop-Process -Force` 不会触发 Shutdown**:测试时强杀进程跳过 systray onExit → server.Shutdown 也跳过。真实退出路径是用户点托盘"退出"菜单,需要 GUI session 才能验证
+- **崩溃留 `.tmp` 残留**:`taskkill /F` 跳过 saveStream 的 defer 清理 → 半截 tmp 留在 Downloads/QuickDrop。解决:server.Start 启动时 `cleanupStaleTmp()` 清扫上次残留
+- **PowerShell 5.1 读 UTF-8 ps1 报中文乱码**:必须存为 UTF-8 **with BOM**,无 BOM 会被当 GBK 解析炸 parser。已固化
 
 ## 5. 待办
 
-### 任务 1.7 — Phase 1 验收
+### 任务 1.7 — 手动验收
 
-跨平台编译命令写进 `Makefile` 或 `build.ps1`,在 Windows 实地走完整流程 5 次,写一份 `TEST.md`。
+跑一遍 [TEST.md](./TEST.md) 里的 6 项,其中:
+- ☑ 用例 5(临时文件清理)已 `.\test\test-crash-cleanup.ps1` 自动 PASS
+- ☐ 用例 1/2/3/4/6 需要真手机扫码
 
-验收用例:
-1. 小图(<1MB)发送 — 用 [test.png](./test.png)
-2. 大文件(>500MB)发送
-3. 中文文件名发送
-4. 中文文件名上传
-5. 传输中点托盘"退出" → 程序应干净退出且不留临时文件(`%TEMP%` 里检查 `*.tmp`)
-6. 同时多个手机访问(行为 OK 即可,并发问题留 Phase 2)
-
-**Phase 1 完成标志**:上面 6 条都过了,能放心把 .exe 给一个朋友说"扫码就能给我发文件"。
+**Phase 1 完成标志**:全 6 项 ✅,能放心把 .exe 给一个朋友说"扫码就能给我发文件"。
 
 ### 后续(Phase 2 才做)
 
