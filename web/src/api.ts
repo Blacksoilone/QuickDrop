@@ -37,6 +37,7 @@ export interface PendingEntry {
   fileName: string;
   fileSize: number;
   arriveAt: number; // Unix 秒
+  trust: "ask" | "trusted" | "blocked"; // ADR-20 设备信任等级
 }
 
 export async function fetchPending(): Promise<PendingEntry[]> {
@@ -45,16 +46,55 @@ export async function fetchPending(): Promise<PendingEntry[]> {
   return r.json();
 }
 
-// 决策一条 incoming: accept 触发 daemon 异步 Pull, reject 仅改状态.
-export async function decidePeer(token: string, decision: "accept" | "reject"): Promise<void> {
+// 决策一条 incoming.
+// trust 可选: accept 时同时设 trust="trusted" (信任此设备),
+//             reject 时同时设 trust="blocked" (永不信任).
+export async function decidePeer(
+  token: string,
+  decision: "accept" | "reject",
+  trust?: "trusted" | "blocked",
+): Promise<void> {
+  const body: Record<string, string> = { token, decision };
+  if (trust) body.trust = trust;
   const r = await fetch("/internal/peer-decide", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token, decision }),
+    body: JSON.stringify(body),
   });
   if (!r.ok) {
     const txt = await r.text();
     throw new Error(`peer-decide ${r.status}: ${txt}`);
+  }
+}
+
+// /api/devices 返回的设备记录.
+export interface DeviceEntry {
+  uuid: string;
+  name: string;
+  trust: "ask" | "trusted" | "blocked";
+  firstSeen: number;
+  lastSeen: number;
+}
+
+export async function fetchDevices(): Promise<DeviceEntry[]> {
+  const r = await fetch("/api/devices", { cache: "no-store" });
+  if (!r.ok) throw new Error(`/api/devices ${r.status}`);
+  return r.json();
+}
+
+export async function setDeviceTrust(
+  uuid: string,
+  name: string,
+  trust: "ask" | "trusted" | "blocked",
+): Promise<void> {
+  const r = await fetch("/internal/device-trust", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ uuid, name, trust }),
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`device-trust ${r.status}: ${txt}`);
   }
 }
 

@@ -50,6 +50,22 @@ func Incoming(fromName, fileName string, fileSize int64, token string) {
 	}
 }
 
+// IncomingSilent 信任设备 (ADR-20) 触发 auto-accept 时弹的纯通知 toast.
+// 没有按钮 - 用户来不及干预, 但能知道发生了什么.
+// 想撤回信任 → 设备管理页 /v.
+func IncomingSilent(fromName, fileName string, fileSize int64) {
+	n := toast.Notification{
+		AppID:    appID,
+		Title:    fmt.Sprintf("来自信任设备 %s", fromName),
+		Message:  fmt.Sprintf("已自动接受 %s (%s)", fileName, humanSize(fileSize)),
+		Duration: toast.Short,
+		Audio:    toast.Default,
+	}
+	if err := n.Push(); err != nil {
+		log.Printf("toast (silent) 推送失败: %v", err)
+	}
+}
+
 func humanSize(n int64) string {
 	const unit = 1024
 	if n < unit {

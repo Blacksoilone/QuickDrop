@@ -11,6 +11,8 @@ import {
 
 const items = ref<PendingEntry[]>([]);
 const error = ref<string>("");
+// token → 是否勾选了"信任此设备" (Accept 同时设 trusted, Reject 同时设 blocked)
+const trustOnAccept = ref<Record<string, boolean>>({});
 let timer: number | undefined;
 
 onMounted(async () => {
@@ -32,18 +34,18 @@ async function refresh() {
   }
 }
 
-async function accept(p: PendingEntry) {
+async function accept(p: PendingEntry, trustChoice: "" | "trusted") {
   try {
-    await decidePeer(p.token, "accept");
+    await decidePeer(p.token, "accept", trustChoice || undefined);
     await refresh();
   } catch (e) {
     error.value = String(e);
   }
 }
 
-async function reject(p: PendingEntry) {
+async function reject(p: PendingEntry, trustChoice: "" | "blocked") {
   try {
-    await decidePeer(p.token, "reject");
+    await decidePeer(p.token, "reject", trustChoice || undefined);
     await refresh();
   } catch (e) {
     error.value = String(e);
@@ -98,8 +100,22 @@ function stateLabel(s: PendingEntry["state"]): string {
           </div>
         </div>
         <div class="actions" v-if="p.state === 'pending'">
-          <button class="btn accept" @click="accept(p)">接受</button>
-          <button class="btn reject" @click="reject(p)">拒绝</button>
+          <label class="trust-chk" title="勾上后, 此设备以后发文件自动接受 (可在设备管理页撤回)">
+            <input
+              type="checkbox"
+              v-model="trustOnAccept[p.token]"
+            />
+            <span>信任此设备</span>
+          </label>
+          <button
+            class="btn accept"
+            @click="accept(p, trustOnAccept[p.token] ? 'trusted' : '')"
+          >接受</button>
+          <button
+            class="btn reject"
+            @click="reject(p, trustOnAccept[p.token] ? 'blocked' : '')"
+            :title="trustOnAccept[p.token] ? '拒绝并永不信任此设备 (黑名单)' : '只拒绝本次'"
+          >拒绝</button>
         </div>
       </li>
     </ul>
@@ -202,6 +218,20 @@ h1 {
   display: flex;
   gap: 6px;
   flex: 0 0 auto;
+  align-items: center;
+}
+.trust-chk {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: #666;
+  cursor: pointer;
+  user-select: none;
+  margin-right: 4px;
+}
+.trust-chk input {
+  cursor: pointer;
 }
 .btn {
   padding: 4px 12px;

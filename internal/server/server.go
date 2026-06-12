@@ -75,6 +75,10 @@ type Server struct {
 	// 由 SetPeerManager 注入. nil 时 /peer/* 路由全 404.
 	peers PeerManager
 
+	// deviceStore 设备信任表 (ADR-20). 由 SetDeviceStore 注入.
+	// nil 时所有设备视为 ask, /api/devices 返回空.
+	deviceStore DeviceStore
+
 	// myIdentity 本机身份 (UUID + 显示名), 给 /peer/incoming 时填 from 字段用.
 	// 由 SetIdentity 注入.
 	myUUID string
@@ -82,7 +86,8 @@ type Server struct {
 
 	onSwap         func(newName string)                                            // 文件被 SwapFile 切换后回调 (tray tooltip 用)
 	onReceive      func(on bool)                                                   // 接收模式切换后回调 (main 起/关 receive webview)
-	onPeerIncoming func(fromName, fileName string, fileSize int64, token string)   // peer incoming 到达后回调 (弹 toast)
+	onPeerIncoming func(fromName, fileName string, fileSize int64, token string)   // peer incoming ask 时弹 toast (按钮)
+	onPeerAccepted func(fromName, fileName string, fileSize int64)                 // peer incoming trusted 自动接受时弹纯通知
 	onPendingChange func(count int)                                                 // 待处理数变化后回调 (tray 红点+菜单显隐)
 }
 
@@ -126,6 +131,24 @@ type PendingEntry struct {
 	FileName string `json:"fileName"`
 	FileSize int64  `json:"fileSize"`
 	ArriveAt int64  `json:"arriveAt"` // Unix 秒
+	Trust    string `json:"trust"`    // 该发送方设备当前 trust (ask/trusted/blocked), 给 Vue 显示徽章用
+}
+
+// DeviceStore 信任表接口. 实现是 internal/devices.Store, 抽 interface 避免循环 import.
+type DeviceStore interface {
+	TrustOf(uuid string) string                       // 返 "ask" / "trusted" / "blocked", 未知设备返 "ask"
+	UpsertSeen(uuid, name string) error               // 收到 incoming 时更新最近见到
+	SetTrust(uuid, name, trust string) error          // 用户操作 /v 管理页或 pending 决策时调
+	All() []DeviceEntry                               // 列所有已知设备
+}
+
+// DeviceEntry 给 /api/devices 用的快照.
+type DeviceEntry struct {
+	UUID      string `json:"uuid"`
+	Name      string `json:"name"`
+	Trust     string `json:"trust"`
+	FirstSeen int64  `json:"firstSeen"`
+	LastSeen  int64  `json:"lastSeen"`
 }
 
 // Peer 与 internal/discovery.Peer 字段同名同义, 为了 server → JSON 转换不引入循环依赖,
@@ -250,10 +273,16 @@ func (s *Server) SetIdentity(uuid, name string) {
 	s.myName = name
 }
 
-// SetOnPeerIncoming 注册 peer incoming 到达回调 (典型用法: 弹 toast).
+// SetOnPeerIncoming 注册 peer incoming (ask) 到达回调 (典型用法: 弹 toast 按钮).
 // 必须在 Start 之前调用.
 func (s *Server) SetOnPeerIncoming(fn func(fromName, fileName string, fileSize int64, token string)) {
 	s.onPeerIncoming = fn
+}
+
+// SetOnPeerAccepted 注册 peer incoming 因信任而自动接受时的回调 (典型: 弹纯通知 toast).
+// 必须在 Start 之前调用.
+func (s *Server) SetOnPeerAccepted(fn func(fromName, fileName string, fileSize int64)) {
+	s.onPeerAccepted = fn
 }
 
 // SetOnPendingChange 注册待处理数变化回调 (典型用法: tray.SetPendingCount).
@@ -261,6 +290,12 @@ func (s *Server) SetOnPeerIncoming(fn func(fromName, fileName string, fileSize i
 // 必须在 Start 之前调用.
 func (s *Server) SetOnPendingChange(fn func(count int)) {
 	s.onPendingChange = fn
+}
+
+// SetDeviceStore 注入设备信任表 (来自 internal/devices.Store).
+// 必须在 Start 之前调用. nil 时所有设备视为 ask.
+func (s *Server) SetDeviceStore(d DeviceStore) {
+	s.deviceStore = d
 }
 
 // emitPendingChange 在 peer manager 状态可能变化后调用.
@@ -317,10 +352,12 @@ func (s *Server) Start() {
 	mux.HandleFunc("/upload", s.handleUpload)
 	// Peer 待处理列表 dashboard (Vue), 不受 receiveMode 门禁 (PC→PC 走另一套路)
 	mux.HandleFunc("/p", s.handlePendingDashboard)
+	mux.HandleFunc("/v", s.handleDevicesDashboard)
 	// JSON API (Vue 前端拉服务状态)
 	mux.HandleFunc("/api/info", s.handleAPIInfo)
 	mux.HandleFunc("/api/peers", s.handleAPIPeers)
 	mux.HandleFunc("/api/pending", s.handleAPIPending)
+	mux.HandleFunc("/api/devices", s.handleAPIDevices)
 	// PC↔PC peer 传输 (来自其他 daemon)
 	mux.HandleFunc("/peer/incoming", s.handlePeerIncoming)
 	mux.HandleFunc("/peer/file", s.handlePeerFile)
@@ -330,6 +367,7 @@ func (s *Server) Start() {
 	mux.HandleFunc("/internal/receive", requireLocal(s.handleInternalReceive))
 	mux.HandleFunc("/internal/peer-send", requireLocal(s.handleInternalPeerSend))
 	mux.HandleFunc("/internal/peer-decide", requireLocal(s.handleInternalPeerDecide))
+	mux.HandleFunc("/internal/device-trust", requireLocal(s.handleInternalDeviceTrust))
 	// 静态资源 (Vue chunks / CSS)
 	mux.Handle("/assets/", http.FileServer(http.FS(s.dist)))
 
@@ -460,6 +498,12 @@ func (s *Server) handlePendingDashboard(w http.ResponseWriter, r *http.Request) 
 	s.serveDistFile(w, r, "p.html")
 }
 
+// handleDevicesDashboard /v : 设备管理页 (Vue). 列出所有已知设备,
+// 用户可设/撤 trust/block (ADR-20). 始终可达.
+func (s *Server) handleDevicesDashboard(w http.ResponseWriter, r *http.Request) {
+	s.serveDistFile(w, r, "v.html")
+}
+
 // serveDistFile 从嵌入的 web/dist 读取文件, 加 no-store 防手机缓存看到旧文件名.
 func (s *Server) serveDistFile(w http.ResponseWriter, r *http.Request, name string) {
 	data, err := fs.ReadFile(s.dist, name)
@@ -509,11 +553,32 @@ func (s *Server) handleAPIPeers(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAPIPending /api/pending : Vue 前端拉待决策的 incoming 列表.
-// 给 2.5e 的红点 UI / pending 列表页用.
+// 给 2.5e 的红点 UI / pending 列表页用. 每条 join device store 的 trust 字段.
 func (s *Server) handleAPIPending(w http.ResponseWriter, r *http.Request) {
 	list := []PendingEntry{}
 	if s.peers != nil {
 		list = s.peers.PendingList()
+	}
+	// join trust
+	if s.deviceStore != nil {
+		for i := range list {
+			list[i].Trust = s.deviceStore.TrustOf(list[i].From.UUID)
+		}
+	} else {
+		for i := range list {
+			list[i].Trust = "ask"
+		}
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(list)
+}
+
+// handleAPIDevices /api/devices : Vue 设备管理页 (/v) 拉所有已知设备.
+func (s *Server) handleAPIDevices(w http.ResponseWriter, r *http.Request) {
+	list := []DeviceEntry{}
+	if s.deviceStore != nil {
+		list = s.deviceStore.All()
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -522,7 +587,11 @@ func (s *Server) handleAPIPending(w http.ResponseWriter, r *http.Request) {
 
 // handlePeerIncoming POST /peer/incoming : 来自其他 daemon 的发送邀请.
 // body = JSON { token, from: {uuid,name,host,ipv4,port}, fileName, fileSize }
-// 入待决策队列, 等用户 (toast/Vue/CLI) 接受或拒绝.
+//
+// ADR-20 信任分支:
+//   blocked → 静默 reject, 不入 pending, 不弹 toast (但记录到 device store 以便 UI 看到)
+//   trusted → 入 pending 立即 SetPendingState(accepted), 启异步 Pull, 弹纯通知 toast
+//   ask    → 入 pending 等用户决策, 弹 toast 按钮
 func (s *Server) handlePeerIncoming(w http.ResponseWriter, r *http.Request) {
 	if s.peers == nil {
 		http.NotFound(w, r)
@@ -552,16 +621,48 @@ func (s *Server) handlePeerIncoming(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "token/from.uuid/fileName 不能为空", http.StatusBadRequest)
 		return
 	}
+
+	// 更新设备表 lastSeen (即使被 block 也记, 让用户看到"有人想发但被你拉黑")
+	trust := "ask"
+	if s.deviceStore != nil {
+		_ = s.deviceStore.UpsertSeen(body.From.UUID, body.From.Name)
+		trust = s.deviceStore.TrustOf(body.From.UUID)
+	}
+
+	// blocked: 直接 reject, 不入 pending. 对端会等 TTL 自然清理.
+	if trust == "blocked" {
+		log.Printf("blocked peer 邀请: %s (%s) → 静默拒绝", body.From.Name, body.From.UUID[:8])
+		// 返回 200 让对端 IPC 看起来 OK (避免对端用错误判断重试), 但实际啥也不做
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("queued"))
+		return
+	}
+
 	if err := s.peers.AddPending(body.Token, body.From.UUID, body.From.Name, body.From.Host, body.From.IPv4, body.From.Port, body.FileName, body.FileSize); err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
-	log.Printf("收到 peer 邀请: %s 想发 %s (%d 字节) token=%s", body.From.Name, body.FileName, body.FileSize, body.Token[:8])
+	log.Printf("收到 peer 邀请: %s 想发 %s (%d 字节) token=%s trust=%s", body.From.Name, body.FileName, body.FileSize, body.Token[:8], trust)
 
-	// 异步弹 toast (ADR-19). 不阻塞 HTTP 200 返回给对端.
-	if s.onPeerIncoming != nil {
-		go s.onPeerIncoming(body.From.Name, body.FileName, body.FileSize, body.Token)
+	if trust == "trusted" {
+		// 信任设备: 立刻 accept + Pull. 弹纯通知 toast 告知 (无按钮).
+		s.peers.SetPendingState(body.Token, "accepted")
+		go s.pullPeerFile(body.Token, body.From.IPv4, body.From.Port, body.FileName, body.FileSize)
+		if s.onPeerIncoming != nil {
+			// onPeerIncoming 用 token 作为 hint, main 那边判断: trust=trusted 时调 IncomingSilent
+			// 但 server 不知道 main 的实现; 简单的做法: 复用 onPeerIncoming 传特殊 token "" 表示静默
+			// 这里改为新增一个 onPeerAccepted 回调.
+		}
+		if s.onPeerAccepted != nil {
+			go s.onPeerAccepted(body.From.Name, body.FileName, body.FileSize)
+		}
+	} else {
+		// ask: 弹按钮 toast 等用户
+		if s.onPeerIncoming != nil {
+			go s.onPeerIncoming(body.From.Name, body.FileName, body.FileSize, body.Token)
+		}
 	}
+
 	// 通知 tray 更新红点 + 菜单 + tooltip (2.5e fallback)
 	s.emitPendingChange()
 
@@ -719,7 +820,10 @@ func (s *Server) handleInternalPeerSend(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleInternalPeerDecide POST /internal/peer-decide : Bob 端 toast/CLI/Vue 决策.
-// body = JSON { token, decision: "accept"|"reject" }
+// body = JSON { token, decision: "accept"|"reject", trust?: "trusted"|"blocked" }
+// 可选 trust: accept 时同时设设备 trust=trusted (信任), reject 时同时设 trust=blocked (永不信任).
+// 不传 trust 字段则只决策本次, 不动 device 表.
+//
 // accept → 异步 GET http://from/peer/file?token=xxx 流式存到 Downloads/QuickDrop/
 // reject → 改 pending 状态, 不通知对端 (对端等 outgoing TTL 自然清掉)
 // 仅 127.0.0.1.
@@ -735,6 +839,7 @@ func (s *Server) handleInternalPeerDecide(w http.ResponseWriter, r *http.Request
 	var body struct {
 		Token    string `json:"token"`
 		Decision string `json:"decision"`
+		Trust    string `json:"trust,omitempty"` // 可选: trusted (accept 时) / blocked (reject 时)
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body); err != nil {
 		http.Error(w, "解析 body 失败: "+err.Error(), http.StatusBadRequest)
@@ -751,9 +856,23 @@ func (s *Server) handleInternalPeerDecide(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// 如果带了 trust 参数 + 我们能查到设备, 一并更新 device store
+	if body.Trust != "" && s.deviceStore != nil {
+		// 从 pending 拿到的 fromUUID 在内部状态机里, 这里 Lookup 一下完整 entry
+		// 走 PendingList 简化 (本来就 join 了 trust, 找出对应 entry)
+		for _, p := range s.peers.PendingList() {
+			if p.Token == body.Token {
+				if err := s.deviceStore.SetTrust(p.From.UUID, p.From.Name, body.Trust); err != nil {
+					log.Printf("设 trust 失败: %v", err)
+				}
+				break
+			}
+		}
+	}
+
 	if body.Decision == "reject" {
 		s.peers.SetPendingState(body.Token, "rejected")
-		log.Printf("拒绝 peer 邀请 token=%s file=%s", body.Token[:8], fileName)
+		log.Printf("拒绝 peer 邀请 token=%s file=%s trust=%s", body.Token[:8], fileName, body.Trust)
 		s.emitPendingChange()
 		resp200JSON(w, map[string]string{"decision": "rejected"})
 		return
@@ -764,6 +883,40 @@ func (s *Server) handleInternalPeerDecide(w http.ResponseWriter, r *http.Request
 	go s.pullPeerFile(body.Token, fromIPv4, fromPort, fileName, fileSize)
 	s.emitPendingChange()
 	resp200JSON(w, map[string]string{"decision": "accepted", "pulling": "started"})
+}
+
+// handleInternalDeviceTrust POST /internal/device-trust : 设备管理页 (Vue /v) 用.
+// body = JSON { uuid, name?, trust }
+// 设备不存在会新建 (允许预先信任/拉黑还没见过的设备).
+// 仅 127.0.0.1.
+func (s *Server) handleInternalDeviceTrust(w http.ResponseWriter, r *http.Request) {
+	if s.deviceStore == nil {
+		http.Error(w, "device store 未启用", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "需要 POST", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		UUID  string `json:"uuid"`
+		Name  string `json:"name"`
+		Trust string `json:"trust"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4*1024)).Decode(&body); err != nil {
+		http.Error(w, "解析 body 失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.UUID == "" {
+		http.Error(w, "uuid 不能为空", http.StatusBadRequest)
+		return
+	}
+	if err := s.deviceStore.SetTrust(body.UUID, body.Name, body.Trust); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	log.Printf("设备 trust 已更新: %s (%s) → %s", body.Name, body.UUID[:8], body.Trust)
+	resp200JSON(w, map[string]string{"uuid": body.UUID, "trust": body.Trust})
 }
 
 // pullPeerFile 主动 GET 发送方的 /peer/file?token=xxx, 流式写到 Downloads/QuickDrop/.

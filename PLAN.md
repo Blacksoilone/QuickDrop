@@ -157,6 +157,27 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
   - window.Manager 加 `OpenPendingWindow` 单实例字段 pendCmd
   - test-pending.ps1 12 checks ALL PASS: /p 可达 + pending count 变化 + reject 状态变化
   - **托盘红点 + tooltip 切换 + 菜单显隐是 GUI 行为, 需肉眼验证**
+- [x] **任务 2.6 设备记忆 + 信任白名单** (ADR-20 完整落地):
+  - 新包 `internal/devices`: Store 持久化到 ~/.quickdrop/devices.json,
+    原子写 (临时文件 + rename), 进程崩溃不留半截 JSON
+  - 三档信任: ask (默认弹 toast 按钮) / trusted (静默自动接受 + 纯通知 toast) / blocked (静默拒绝)
+  - server.handlePeerIncoming 按 trust 分支:
+    - blocked → 不入 pending, 不弹 toast (但 UpsertSeen 还记 lastSeen 方便管理页看)
+    - trusted → 立刻 AddPending + SetPendingState("accepted") + 启 Pull + 纯通知 toast
+    - ask → 走 2.5c 原路径 (弹按钮 toast 等用户)
+  - 新 API:
+    - GET `/api/devices` 列所有已知设备 (按 lastSeen 倒序)
+    - POST `/internal/device-trust` { uuid, name?, trust } 设/撤
+    - GET `/api/pending` 每条 join trust 字段给 Vue 显示徽章
+    - POST `/internal/peer-decide` 加可选 `trust` 参数 (accept→trusted / reject→blocked 一气呵成)
+  - 新 Vue 页:
+    - Pending.vue 每条加 checkbox "信任此设备"; 接受时同时设 trusted, 拒绝时同时设 blocked
+    - Devices.vue (新, /v 路由) 列所有已知设备, 每条 [每次问][信任][黑名单] 三按钮直接切
+  - 新 notify.IncomingSilent: 信任设备自动接受时弹纯通知 toast (无按钮)
+  - test-devices.ps1 24 checks ALL PASS:
+    UpsertSeen / 设 trust 持久化 / trusted 立即 accept / blocked 不入 pending / 重启不丢
+  - **托盘没加 "设备管理" 菜单项**, 用户暂时手动访问 `http://127.0.0.1:8443/v`
+    或者从 Pending 页加链接进入 (后续小修)
 
 ## 4. 遇到的问题
 
@@ -173,16 +194,14 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
 
 ## 5. 待办
 
-### 下一步 — 2.6 设备记忆 + 信任升级
+### 下一步候选
 
-按 [QuickDrop.md §6 Phase 2.6](./QuickDrop.md):
+Phase 2 主体已交付 (2.2/2.3/2.4/2.5a-e/2.7/2.10/2.11/2.13/2.6).
+剩余:
 
-- `~/.quickdrop/devices.json` 记录交互过的设备及是否"信任"
-- 配置页 / `/p` 加 "信任此设备" 复选框, 勾上后该设备发文件:
-  - toast 仍弹但 3 秒后自动接受 (中途用户可点"拒绝"撤销)
-- "永不信任" 黑名单, 黑名单内设备直接 reject
-
-Phase 2.5 全套交付 (a-e + Dashboard 双视图) ✅. PC↔PC 互传从设计到 UI 闭环, v0.9.0 是个自然的发布节点.
+- **2.8 + 2.9** WebSocket 进度 + Windows toast 完成提示: 实时进度条 + 文件传输完成的轻通知
+- **小修**: 托盘加 "设备管理" 菜单项 → 开 /v 子窗 (现在用户得手动访问 URL)
+- **Phase 3** 起步: HTTPS via lancert.dev + PWA manifest, 真机适配
 
 ### 后续 Phase 2 顺位
 

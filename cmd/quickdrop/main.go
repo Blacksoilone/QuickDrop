@@ -33,6 +33,7 @@ import (
 	"strings"
 	"time"
 
+	"quickdrop/internal/devices"
 	"quickdrop/internal/discovery"
 	"quickdrop/internal/identity"
 	"quickdrop/internal/installer"
@@ -384,8 +385,20 @@ func runDaemon(initialPath string, initialReceive bool) {
 	srv.SetDist(distFS)
 	srv.SetIdentity(ident.UUID, ident.Name)
 	srv.SetPeerManager(peerMgrAdapter{peer.NewManager()})
+
+	// 加载设备信任表 (ADR-20). 失败不致命, 退回到"所有设备 ask".
+	if devStore, err := devices.Load(); err == nil {
+		srv.SetDeviceStore(deviceStoreAdapter{devStore})
+		log.Printf("已加载设备信任表: %d 条记录", len(devStore.All()))
+	} else {
+		log.Printf("加载设备信任表失败 (退回到全 ask): %v", err)
+	}
+
 	srv.SetOnPeerIncoming(func(fromName, fileName string, fileSize int64, token string) {
 		notify.Incoming(fromName, fileName, fileSize, token)
+	})
+	srv.SetOnPeerAccepted(func(fromName, fileName string, fileSize int64) {
+		notify.IncomingSilent(fromName, fileName, fileSize)
 	})
 	srv.SetOnPendingChange(func(count int) {
 		tray.SetPendingCount(count)
@@ -558,6 +571,42 @@ func (a peerMgrAdapter) PendingCount() int { return a.m.PendingCount() }
 
 // SetOnChange 转发到底层 peer.Manager. main 用它把 server.emitPendingChange 接到 tray.
 func (a peerMgrAdapter) SetOnChange(fn func()) { a.m.SetOnChange(fn) }
+
+// deviceStoreAdapter 把 internal/devices.Store 适配成 server.DeviceStore.
+// 抽这一层是为了 server 包不依赖 devices 包 (避免循环), 也屏蔽 Trust 类型转 string.
+type deviceStoreAdapter struct{ s *devices.Store }
+
+func (a deviceStoreAdapter) TrustOf(uuid string) string {
+	return string(a.s.TrustOf(uuid))
+}
+
+func (a deviceStoreAdapter) UpsertSeen(uuid, name string) error {
+	return a.s.UpsertSeen(uuid, name)
+}
+
+func (a deviceStoreAdapter) SetTrust(uuid, name, trust string) error {
+	t := devices.Trust(trust)
+	// 兜底: 空串当 ask, 反正 SetTrust 会校验
+	if trust == "" {
+		t = devices.TrustAsk
+	}
+	return a.s.SetTrust(uuid, name, t)
+}
+
+func (a deviceStoreAdapter) All() []server.DeviceEntry {
+	src := a.s.All()
+	out := make([]server.DeviceEntry, len(src))
+	for i, d := range src {
+		out[i] = server.DeviceEntry{
+			UUID:      d.UUID,
+			Name:      d.Name,
+			Trust:     string(d.Trust),
+			FirstSeen: d.FirstSeen,
+			LastSeen:  d.LastSeen,
+		}
+	}
+	return out
+}
 
 func setupLogging() {
 	logPath := filepath.Join(os.TempDir(), "quickdrop.log")
