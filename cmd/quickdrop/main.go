@@ -21,6 +21,7 @@ package main
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -29,11 +30,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"strconv"
+	"runtime"
 	"strings"
 	"time"
 
+	"quickdrop/internal/config"
 	"quickdrop/internal/devices"
 	"quickdrop/internal/discovery"
 	"quickdrop/internal/identity"
@@ -71,20 +74,30 @@ const (
 	//   first-only : 只在 daemon 首次启动时弹窗, 切换文件不开新窗
 	envWindowMode = "QUICKDROP_WINDOW_MODE"
 
-	// envPort: 覆盖 daemon HTTP 端口 (默认 8443).
-	// 主要用于同机起多个 daemon 做 PC→PC 联调测试 (test-discovery.ps1).
-	// probeDaemon / notifyDaemon 都用同一端口, 这样 "QUICKDROP_PORT=8444 quickdrop send X"
-	// 只跟 8444 上的 daemon 对话, 不影响 8443.
+	// envPort: 覆盖 daemon HTTP 端口 (默认 8443). 已迁移到 internal/config (applyEnv).
+	// 保留常量名只为文档目的; 实际读取在 config.Load() 内. 不要在这个文件里直接读.
 	envPort = "QUICKDROP_PORT"
 
 	// version 软件版本, 写入 mDNS TXT 给对端做兼容性判断.
 	version = "0.8.0"
 )
 
-// daemonURL 返回客户端模式要 POST 给本机 daemon 的 base URL.
-// 用 envPort, 这样多端口测试时各自找各自的 daemon.
+// daemonURL 返回客户端模式 (send/recv 子进程) 要 POST 给本机 daemon 的 base URL.
+// 读 config + env, 让用户改 config.json 的 port 后 send 命令也能找对端口.
 func daemonURL() string {
-	return fmt.Sprintf("http://127.0.0.1:%d", portFromEnv())
+	return fmt.Sprintf("http://127.0.0.1:%d", clientPort())
+}
+
+// clientPort 客户端模式 (send/recv) 探测 daemon 监听端口.
+// 优先级 env > config.json > 8443. 与 runDaemon 完全一致.
+func clientPort() int {
+	if m, err := config.Load(); err == nil {
+		p := m.Get().Server.Port
+		if p > 0 && p < 65536 {
+			return p
+		}
+	}
+	return 8443
 }
 
 func usage() {
@@ -364,7 +377,20 @@ func postInternal(path, body string) error {
 // initialPath 为空表示纯接收模式启动 (此时 initialReceive 必须 true, 否则 daemon 啥也不干).
 // initialReceive 表示 daemon 启动后立刻开启接收模式 + 弹接收窗.
 func runDaemon(initialPath string, initialReceive bool) {
-	port := portFromEnv()
+	// 加载配置 (~/.quickdrop/config.json + env 覆盖). 失败用默认.
+	cfgMgr, err := config.Load()
+	if err != nil {
+		log.Printf("加载 config 失败 (用默认): %v", err)
+		// 兜底再来一遍, 这次绝对成功 (默认值不依赖磁盘)
+		cfgMgr, _ = config.Load()
+	}
+	cfg := cfgMgr.Get()
+
+	// port 优先级: env (cfgMgr 已合并) > config.json > 8443
+	port := cfg.Server.Port
+	if port <= 0 {
+		port = 8443
+	}
 
 	// 加载/生成本机身份 (UUID + 显示名)
 	ident, err := identity.Load()
@@ -372,6 +398,21 @@ func runDaemon(initialPath string, initialReceive bool) {
 		log.Fatalf("加载 identity: %v", err)
 	}
 	log.Printf("身份: %s (%s)", ident.Name, ident.UUID[:8])
+	log.Printf("config: port=%d dl=%q conflict=%s maxSize=%d toast=%v reveal=%v mdns=%v autostart=%v",
+		port,
+		cfg.Download.Dir,
+		cfg.Download.Conflict,
+		cfg.Receive.MaxFileSize,
+		cfg.UI.ToastsEnabled,
+		cfg.UI.RevealOnDone,
+		cfg.Server.MdnsEnabled,
+		cfg.System.Autostart,
+	)
+
+	// 同步 autostart 到 HKCU\Run (cfg 真源, 注册表跟着)
+	if err := installer.SyncAutostart(cfg.System.Autostart); err != nil {
+		log.Printf("同步 autostart 注册表失败: %v", err)
+	}
 
 	// 自检: URL scheme 未注册时 toast 按钮点了会报 "没有应用能打开此链接".
 	// 不致命 (用户可能只想发送), 但 log warn 提示用户跑 install 修复.
@@ -388,6 +429,7 @@ func runDaemon(initialPath string, initialReceive bool) {
 	srv.SetIdentity(ident.UUID, ident.Name)
 	srv.SetPeerManager(peerMgrAdapter{peer.NewManager()})
 	srv.SetProgressHub(progressHubAdapter{progress.NewHub()})
+	srv.SetConfig(configAdapter{cfgMgr})
 
 	// 加载设备信任表 (ADR-20). 失败不致命, 退回到"所有设备 ask".
 	if devStore, err := devices.Load(); err == nil {
@@ -397,31 +439,65 @@ func runDaemon(initialPath string, initialReceive bool) {
 		log.Printf("加载设备信任表失败 (退回到全 ask): %v", err)
 	}
 
+	// toast 总开关守卫: cfg.UI.ToastsEnabled=false 时所有 notify.* 静音.
+	// 用闭包 capture cfgMgr, 每次回调实时读最新值 (热配置生效).
+	toastOK := func() bool { return cfgMgr.Get().UI.ToastsEnabled }
+
 	srv.SetOnPeerIncoming(func(fromName, fileName string, fileSize int64, token string) {
+		if !toastOK() {
+			return
+		}
 		notify.Incoming(fromName, fileName, fileSize, token)
 	})
 	srv.SetOnPeerAccepted(func(fromName, fileName string, fileSize int64) {
+		if !toastOK() {
+			return
+		}
 		notify.IncomingSilent(fromName, fileName, fileSize)
 	})
 	srv.SetOnPeerSent(func(toName, fileName string, fileSize int64) {
+		if !toastOK() {
+			return
+		}
 		notify.PeerSent(toName, fileName, fileSize)
 	})
 	srv.SetOnPeerReceived(func(fromName, fileName string, fileSize int64) {
+		if !toastOK() {
+			return
+		}
 		notify.PeerReceived(fromName, fileName, fileSize)
 	})
 	srv.SetOnUploadDone(func(count int) {
+		if !toastOK() {
+			return
+		}
 		notify.UploadDone(count)
+	})
+	srv.SetOnFileSaved(func(absPath string) {
+		// 文件落盘后: 如果配置 RevealOnDone, 起 explorer /select,<path>
+		// (Windows-only; 其他平台 noop)
+		if !cfgMgr.Get().UI.RevealOnDone {
+			return
+		}
+		revealInExplorer(absPath)
 	})
 	srv.SetOnPendingChange(func(count int) {
 		tray.SetPendingCount(count)
 	})
 
 	// mDNS: 广播自己 + 发现局域网内其他 QuickDrop. 失败不致命.
-	disc, err := discovery.Start(ident.UUID, ident.Name, version, port)
-	if err != nil {
-		log.Printf("mDNS 启动失败 (PC→PC 发现不可用, 但其他功能正常): %v", err)
+	// cfg.Server.MdnsEnabled=false 时彻底不启 (隐身模式).
+	var disc *discovery.Discovery
+	if cfg.Server.MdnsEnabled {
+		d, err := discovery.Start(ident.UUID, ident.Name, version, port)
+		if err != nil {
+			log.Printf("mDNS 启动失败 (PC→PC 发现不可用, 但其他功能正常): %v", err)
+		} else {
+			disc = d
+			srv.SetPeerSource(peerAdapter{disc})
+		}
 	} else {
-		srv.SetPeerSource(peerAdapter{disc})
+		log.Print("mDNS 已在 config 中禁用 (隐身), 跳过广播 + 发现")
 	}
 
 	selfExe, err := os.Executable()
@@ -484,17 +560,9 @@ func runDaemon(initialPath string, initialReceive bool) {
 	})
 }
 
-// portFromEnv 读 QUICKDROP_PORT, 解析失败/空回 8443. 测试支持同机多 daemon.
-func portFromEnv() int {
-	if v := strings.TrimSpace(os.Getenv(envPort)); v != "" {
-		n, err := strconv.Atoi(v)
-		if err == nil && n > 0 && n < 65536 {
-			return n
-		}
-		log.Printf("无效的 %s=%q, 用默认 8443", envPort, v)
-	}
-	return 8443
-}
+// portFromEnv 已迁移到 internal/config (applyEnv 内). 这里保留 stub 供老代码路径,
+// 实际不再被调用 - 删除时机: 验证全链路通 + 一两个版本后.
+// 当前 daemonURL 走 clientPort(), runDaemon 走 cfgMgr.Get().Server.Port.
 
 // peerAdapter 把 internal/discovery.Discovery 适配成 server.PeerSource.
 // 拆这层是因为 server 包不能直接 import discovery (避免循环依赖), 也避免
@@ -647,6 +715,63 @@ func (a progressConnAdapter) Write(ctx context.Context, msg []byte) error {
 
 func (a progressConnAdapter) Close(code int, reason string) error {
 	return a.c.Close(code, reason)
+}
+
+// configAdapter 把 *config.Manager 适配成 server.ConfigStore.
+// 拆 interface 避免 server 直接 import config (虽然不会循环, 但保 server 包纯净).
+type configAdapter struct{ m *config.Manager }
+
+// Snapshot /api/config GET 返回的 JSON 对象. 直接给完整 Config struct.
+func (a configAdapter) Snapshot() any { return a.m.Get() }
+
+// ApplyJSON /internal/config-save POST. 解 body → 校验 → 持久化 + 热应用.
+// 校验/写盘交给 m.Save (它内部已经原子写 + 字段合法性检查).
+// 热应用副作用 (autostart 注册表 / mDNS 重启) 也在这里串起来.
+func (a configAdapter) ApplyJSON(body []byte) error {
+	var next config.Config
+	// 默认值兜底: 解到 next 之前先 Default, 这样 partial body 也能合并而不是清空字段
+	next = a.m.Get()
+	if err := json.Unmarshal(body, &next); err != nil {
+		return fmt.Errorf("解析配置 JSON: %w", err)
+	}
+	// 立刻持久化 + 替换内存副本 (Save 内部加锁)
+	if err := a.m.Save(next); err != nil {
+		return err
+	}
+	// autostart 副作用: 同步 HKCU\Run
+	if err := installer.SyncAutostart(next.System.Autostart); err != nil {
+		log.Printf("ApplyJSON: 同步 autostart 注册表失败: %v", err)
+		// 注册表失败不阻塞 config 保存; UI 端会看到状态没改
+	}
+	log.Printf("config 已热应用: port=%d conflict=%s maxSize=%d toast=%v reveal=%v mdns=%v autostart=%v",
+		next.Server.Port, next.Download.Conflict, next.Receive.MaxFileSize,
+		next.UI.ToastsEnabled, next.UI.RevealOnDone, next.Server.MdnsEnabled, next.System.Autostart)
+	return nil
+}
+
+func (a configAdapter) ResolvedDownloadDir() (string, error) { return a.m.ResolvedDownloadDir() }
+func (a configAdapter) Conflict() string                     { return string(a.m.Get().Download.Conflict) }
+func (a configAdapter) MaxFileSize() int64                   { return a.m.Get().Receive.MaxFileSize }
+func (a configAdapter) ToastsEnabled() bool                  { return a.m.Get().UI.ToastsEnabled }
+func (a configAdapter) RevealOnDone() bool                   { return a.m.Get().UI.RevealOnDone }
+func (a configAdapter) MdnsEnabled() bool                    { return a.m.Get().Server.MdnsEnabled }
+func (a configAdapter) Autostart() bool                      { return a.m.Get().System.Autostart }
+
+// revealInExplorer Windows: 启 explorer.exe /select,<absPath> 让 Explorer 高亮该文件.
+// 其他平台 noop. 失败只 log, 不致命 (用户至少能去 Downloads 文件夹自己找).
+func revealInExplorer(absPath string) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	// 注意 explorer /select 的参数有逗号: "/select,C:\path"
+	// 用 cmd /c start "" 也可以, 但直接 explorer 干净.
+	cmd := exec.Command("explorer.exe", "/select,"+absPath)
+	if err := cmd.Start(); err != nil {
+		log.Printf("revealInExplorer %s 失败: %v", absPath, err)
+		return
+	}
+	// 不等它退出 (explorer 会一直驻留)
+	go func() { _ = cmd.Wait() }()
 }
 
 func setupLogging() {

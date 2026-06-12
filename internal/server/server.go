@@ -86,6 +86,10 @@ type Server struct {
 	// progress 推实时传输进度给 Vue (/ws). 由 SetProgressHub 注入. nil 时不推.
 	progress ProgressPublisher
 
+	// cfg 运行时配置 (~/.quickdrop/config.json). 由 SetConfig 注入.
+	// nil 时全用硬编码默认值 (向后兼容).
+	cfg ConfigStore
+
 	// myIdentity 本机身份 (UUID + 显示名), 给 /peer/incoming 时填 from 字段用.
 	// 由 SetIdentity 注入.
 	myUUID string
@@ -98,6 +102,7 @@ type Server struct {
 	onPeerSent      func(toName, fileName string, fileSize int64)                   // 我作为 sender, 对端 Pull 完成时
 	onPeerReceived  func(fromName, fileName string, fileSize int64)                 // 我作为 receiver (ask 路径), Pull 完成时. trusted 路径不调 (已被 onPeerAccepted 告知)
 	onUploadDone    func(count int)                                                 // 手机 /upload 完成时
+	onFileSaved     func(absPath string)                                            // 任意接收路径文件落盘后. main 用它做 RevealOnDone
 	onPendingChange func(count int)                                                 // 待处理数变化后回调 (tray 红点+菜单显隐)
 }
 
@@ -182,6 +187,30 @@ type ProgressReader interface {
 type ProgressConn interface {
 	Write(ctx context.Context, msg []byte) error
 	Close(code int, reason string) error
+}
+
+// ConfigStore 注入接口, server 通过它读/写运行时配置.
+// 实际实现是 internal/config.Manager. 拆 interface 避免循环.
+type ConfigStore interface {
+	// Snapshot 返回完整 config 的 JSON-serializable 副本. 给 /api/config GET 用.
+	Snapshot() any
+	// ApplyJSON 接 /internal/config-save POST 的原始 body, 校验合法 + 持久化 + 热应用.
+	// 返回 error 时 daemon 端不变.
+	ApplyJSON(body []byte) error
+	// ResolvedDownloadDir 取当前生效的下载目录 (空 → 默认), 同时 MkdirAll.
+	ResolvedDownloadDir() (string, error)
+	// Conflict 当前同名文件冲突策略 (rename/overwrite/reject).
+	Conflict() string
+	// MaxFileSize 接收上限 (字节). 0 表示不限.
+	MaxFileSize() int64
+	// ToastsEnabled toast 总开关.
+	ToastsEnabled() bool
+	// RevealOnDone 接收完成自动 Explorer reveal.
+	RevealOnDone() bool
+	// MdnsEnabled mDNS 广播开关.
+	MdnsEnabled() bool
+	// Autostart 开机自启 (Windows Run 注册表).
+	Autostart() bool
 }
 
 // Peer 与 internal/discovery.Peer 字段同名同义, 为了 server → JSON 转换不引入循环依赖,
@@ -337,6 +366,13 @@ func (s *Server) SetOnUploadDone(fn func(count int)) {
 	s.onUploadDone = fn
 }
 
+// SetOnFileSaved 注册"任意接收路径文件落盘"回调.
+// 典型用法: main 据 RevealOnDone 配置决定是否 explorer /select.
+// 必须在 Start 之前调用.
+func (s *Server) SetOnFileSaved(fn func(absPath string)) {
+	s.onFileSaved = fn
+}
+
 // SetOnPendingChange 注册待处理数变化回调 (典型用法: tray.SetPendingCount).
 // AddPending / SetPendingState / GC expire 都会触发.
 // 必须在 Start 之前调用.
@@ -354,6 +390,12 @@ func (s *Server) SetDeviceStore(d DeviceStore) {
 // 必须在 Start 之前调用. nil 时 /ws 返回 404 + 文件传输不推进度.
 func (s *Server) SetProgressHub(p ProgressPublisher) {
 	s.progress = p
+}
+
+// SetConfig 注入运行时配置 (来自 internal/config.Manager).
+// 必须在 Start 之前调用. nil 时所有字段走硬编码默认值.
+func (s *Server) SetConfig(c ConfigStore) {
+	s.cfg = c
 }
 
 // emitPendingChange 在 peer manager 状态可能变化后调用.
@@ -390,7 +432,7 @@ func (s *Server) Start() {
 	if s.dist == nil {
 		log.Fatal("Server.Start: dist 未注入, 调用方必须先 SetDist")
 	}
-	cleanupStaleTmp()
+	s.cleanupStaleTmp()
 
 	// 把 peer manager 的变化也桥到 emitPendingChange (gc 过期项时也要刷新 tray)
 	if s.peers != nil {
@@ -416,6 +458,7 @@ func (s *Server) Start() {
 	mux.HandleFunc("/api/peers", s.handleAPIPeers)
 	mux.HandleFunc("/api/pending", s.handleAPIPending)
 	mux.HandleFunc("/api/devices", s.handleAPIDevices)
+	mux.HandleFunc("/api/config", s.handleAPIConfig)
 	// PC↔PC peer 传输 (来自其他 daemon)
 	mux.HandleFunc("/peer/incoming", s.handlePeerIncoming)
 	mux.HandleFunc("/peer/file", s.handlePeerFile)
@@ -426,6 +469,7 @@ func (s *Server) Start() {
 	mux.HandleFunc("/internal/peer-send", requireLocal(s.handleInternalPeerSend))
 	mux.HandleFunc("/internal/peer-decide", requireLocal(s.handleInternalPeerDecide))
 	mux.HandleFunc("/internal/device-trust", requireLocal(s.handleInternalDeviceTrust))
+	mux.HandleFunc("/internal/config-save", requireLocal(s.handleInternalConfigSave))
 	// WebSocket: 推实时传输进度给 Vue. 任意 LAN 都能连 (只读, 不暴露敏感信息).
 	mux.HandleFunc("/ws", s.handleWS)
 	// 静态资源 (Vue chunks / CSS)
@@ -645,6 +689,43 @@ func (s *Server) handleAPIDevices(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(list)
 }
 
+// handleAPIConfig /api/config : Vue 配置页拉当前 config 完整快照.
+// cfg 未注入时返回空 object.
+func (s *Server) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if s.cfg == nil {
+		w.Write([]byte("{}"))
+		return
+	}
+	_ = json.NewEncoder(w).Encode(s.cfg.Snapshot())
+}
+
+// handleInternalConfigSave POST /internal/config-save : Vue 配置页保存按钮.
+// body = 完整 Config JSON. 校验合法 + 持久化 + 热应用.
+// 仅 127.0.0.1.
+func (s *Server) handleInternalConfigSave(w http.ResponseWriter, r *http.Request) {
+	if s.cfg == nil {
+		http.Error(w, "config 未注入", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "需要 POST", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 32*1024))
+	if err != nil {
+		http.Error(w, "读 body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.cfg.ApplyJSON(body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	log.Print("config 已保存 + 热应用")
+	resp200JSON(w, map[string]string{"ok": "saved"})
+}
+
 // handleWS /ws : 给 Vue 推实时传输进度. 任意 LAN 都能连 (内容只读, 不含敏感信息).
 // progress hub 不在则 404.
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -711,6 +792,15 @@ func (s *Server) handlePeerIncoming(w http.ResponseWriter, r *http.Request) {
 	if body.Token == "" || body.From.UUID == "" || body.FileName == "" {
 		http.Error(w, "token/from.uuid/fileName 不能为空", http.StatusBadRequest)
 		return
+	}
+
+	// maxFileSize 守卫: 配置非 0 时, 超出大小直接拒收 (不入 pending, 不弹 toast).
+	if s.cfg != nil {
+		if max := s.cfg.MaxFileSize(); max > 0 && body.FileSize > max {
+			log.Printf("peer incoming 超大小上限 %d > %d, 拒收: %s", body.FileSize, max, body.FileName)
+			http.Error(w, fmt.Sprintf("文件 %d 字节超出本端配置上限 %d", body.FileSize, max), http.StatusRequestEntityTooLarge)
+			return
+		}
 	}
 
 	// 更新设备表 lastSeen (即使被 block 也记, 让用户看到"有人想发但被你拉黑")
@@ -1028,13 +1118,17 @@ func (s *Server) pullPeerFile(token, fromIPv4 string, fromPort int, fromName, fi
 		return
 	}
 
-	dir, err := downloadsDir()
+	dir, err := s.downloadsDir()
 	if err != nil {
 		log.Printf("Pull 失败 - 创建目录: %v", err)
 		return
 	}
 	safeName := filepath.Base(fileName)
-	finalPath := filepath.Join(dir, safeName)
+	finalPath, err := s.resolveSavePath(dir, safeName)
+	if err != nil {
+		log.Printf("Pull 拒绝 (conflict reject): %v", err)
+		return
+	}
 	tmpPath := finalPath + ".tmp"
 
 	// 包 progress reader 推实时进度给 Vue. nil 时直接用原始 body.
@@ -1055,6 +1149,10 @@ func (s *Server) pullPeerFile(token, fromIPv4 string, fromPort int, fromName, fi
 	log.Printf("Pull peer 完成: %s (%d 字节) silent=%v", finalPath, fileSize, silent)
 	if !silent && s.onPeerReceived != nil {
 		go s.onPeerReceived(fromName, fileName, fileSize)
+	}
+	// reveal 在主流程: 让 main 决定 (它知道 RevealOnDone 配置 + 平台限制)
+	if s.onFileSaved != nil {
+		go s.onFileSaved(finalPath)
 	}
 }
 
@@ -1163,7 +1261,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dir, err := downloadsDir()
+	dir, err := s.downloadsDir()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1187,7 +1285,13 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 		// 取 Base 防路径穿越
 		safeName := filepath.Base(part.FileName())
-		finalPath := filepath.Join(dir, safeName)
+		finalPath, err := s.resolveSavePath(dir, safeName)
+		if err != nil {
+			part.Close()
+			log.Printf("Upload 拒绝 %s (conflict): %v", safeName, err)
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
 		tmpPath := finalPath + ".tmp"
 
 		// 包 progress reader. multipart part 不知道精确大小, 用 r.ContentLength 当上限
@@ -1199,6 +1303,21 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			pr = s.progress.WrapReader(part, uid, "upload", safeName, r.ContentLength)
 			src = pr
 		}
+
+		// maxFileSize 守卫: 用 io.LimitReader 包一层, 超出直接返 EOF 截断;
+		// 但更友好的是先用 ContentLength 拦. ContentLength 是 multipart 整包大小, 不精确,
+		// 所以 LimitReader 是兜底.
+		if s.cfg != nil {
+			if max := s.cfg.MaxFileSize(); max > 0 {
+				if r.ContentLength > 0 && r.ContentLength > max {
+					part.Close()
+					http.Error(w, fmt.Sprintf("文件超出配置上限 (%d > %d 字节)", r.ContentLength, max), http.StatusRequestEntityTooLarge)
+					return
+				}
+				src = io.LimitReader(src, max+1) // +1 用来检测越界, 见下方校验
+			}
+		}
+
 		saveErr := saveStream(tmpPath, finalPath, src)
 		if pr != nil {
 			pr.Done(saveErr)
@@ -1209,8 +1328,22 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, saveErr.Error(), http.StatusInternalServerError)
 			return
 		}
+		// 越界检测: LimitReader 兜底, 文件大小 == max+1 时认为越界
+		if s.cfg != nil {
+			if max := s.cfg.MaxFileSize(); max > 0 {
+				if info, err := os.Stat(finalPath); err == nil && info.Size() > max {
+					_ = os.Remove(finalPath)
+					part.Close()
+					http.Error(w, "文件超出配置上限", http.StatusRequestEntityTooLarge)
+					return
+				}
+			}
+		}
 		part.Close()
 		log.Printf("接收完成: %s", finalPath)
+		if s.onFileSaved != nil {
+			go s.onFileSaved(finalPath)
+		}
 		count++
 	}
 
@@ -1275,7 +1408,13 @@ func contentDisposition(filename string) string {
 		asciiSafe, url.PathEscape(filename))
 }
 
-func downloadsDir() (string, error) {
+// downloadsDir 接收文件的根目录. 优先 cfg.ResolvedDownloadDir, 否则回退 ~/Downloads/QuickDrop/.
+// 调用者拿到目录路径已含 MkdirAll, 直接 filepath.Join 用即可.
+func (s *Server) downloadsDir() (string, error) {
+	if s.cfg != nil {
+		return s.cfg.ResolvedDownloadDir()
+	}
+	// fallback (cfg 未注入, 比如旧代码路径): 跟之前一致
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("拿不到用户家目录: %w", err)
@@ -1287,11 +1426,48 @@ func downloadsDir() (string, error) {
 	return dir, nil
 }
 
+// resolveSavePath 根据 conflict 策略决定最终落盘路径.
+// dir + name → finalPath. 返回 error 表示 "reject" 拒绝接收.
+//
+//	rename    final 已存在 → name (1).ext, (2).ext...; 找空位返回
+//	overwrite 直接覆盖 (沿用旧行为)
+//	reject    final 已存在 → 返 error
+func (s *Server) resolveSavePath(dir, name string) (string, error) {
+	final := filepath.Join(dir, name)
+	policy := "rename" // 默认
+	if s.cfg != nil {
+		policy = s.cfg.Conflict()
+	}
+	if _, err := os.Stat(final); os.IsNotExist(err) {
+		return final, nil
+	}
+	switch policy {
+	case "overwrite":
+		return final, nil
+	case "reject":
+		return "", fmt.Errorf("%s 已存在, 配置为 reject", name)
+	case "rename", "":
+		// 拆 base + ext, 在中间插 (N)
+		ext := filepath.Ext(name)
+		base := strings.TrimSuffix(name, ext)
+		for i := 1; i < 10000; i++ {
+			cand := filepath.Join(dir, fmt.Sprintf("%s (%d)%s", base, i, ext))
+			if _, err := os.Stat(cand); os.IsNotExist(err) {
+				return cand, nil
+			}
+		}
+		return "", fmt.Errorf("%s 重命名尝试 10000 次仍冲突", name)
+	default:
+		// 未知 policy 走 rename 兜底
+		return final, nil
+	}
+}
+
 // cleanupStaleTmp 删除 Downloads/QuickDrop 下上次进程异常退出留下的 *.tmp.
 // 正常路径 saveStream 写完会 rename, 不会留 tmp; 但 -F 强杀或 OS 崩溃会留半截文件.
 // 启动时清扫一次, 避免越攒越多 + 用户疑惑. 失败不致命, 打日志继续.
-func cleanupStaleTmp() {
-	dir, err := downloadsDir()
+func (s *Server) cleanupStaleTmp() {
+	dir, err := s.downloadsDir()
 	if err != nil {
 		return
 	}

@@ -16,6 +16,7 @@ package installer
 
 import (
 	"fmt"
+	"os"
 
 	"golang.org/x/sys/windows/registry"
 )
@@ -164,4 +165,48 @@ func IsURLSchemeInstalled() bool {
 	defer key.Close()
 	_, _, err = key.GetStringValue("")
 	return err == nil
+}
+
+// autostartRunKey HKCU\Software\Microsoft\Windows\CurrentVersion\Run\QuickDrop.
+// Windows 用户登录时按这里的列表挨个起进程, 值是命令行字符串.
+// HKCU 不需要 UAC, 跟 IsInstalled 路径同源 (用户级).
+const (
+	autostartRunPath = `Software\Microsoft\Windows\CurrentVersion\Run`
+	autostartRunName = "QuickDrop"
+)
+
+// SyncAutostart 把 config.System.Autostart 同步到注册表 HKCU\...\Run.
+// enable=true: 写 "<exe>" recv  (无图形界面参数, 进入纯接收 daemon)
+// enable=false: 删 QuickDrop 这一项 (不存在不报错)
+// exe 路径用 os.Executable() 当前进程, 跟用户实际启动的二进制保持一致.
+func SyncAutostart(enable bool) error {
+	if enable {
+		exe, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("拿 exe 路径: %w", err)
+		}
+		key, _, err := registry.CreateKey(registry.CURRENT_USER, autostartRunPath, registry.SET_VALUE)
+		if err != nil {
+			return fmt.Errorf("打开 Run 键: %w", err)
+		}
+		defer key.Close()
+		// 注意 recv 表示启动进入接收守护模式; 不加 "recv" 的话双击会被当作 send 模式
+		// 然后 usage 报错退出.
+		val := fmt.Sprintf(`"%s" recv`, exe)
+		if err := key.SetStringValue(autostartRunName, val); err != nil {
+			return fmt.Errorf("写 Run 值: %w", err)
+		}
+		return nil
+	}
+	// disable: 删值. 键本身不删 (其他应用可能也用 Run 键).
+	key, err := registry.OpenKey(registry.CURRENT_USER, autostartRunPath, registry.SET_VALUE)
+	if err != nil {
+		// 键不存在视为已禁用, 不报错
+		return nil
+	}
+	defer key.Close()
+	if err := key.DeleteValue(autostartRunName); err != nil && err != registry.ErrNotExist {
+		return fmt.Errorf("删 Run 值: %w", err)
+	}
+	return nil
 }
