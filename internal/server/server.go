@@ -84,10 +84,13 @@ type Server struct {
 	myUUID string
 	myName string
 
-	onSwap         func(newName string)                                            // 文件被 SwapFile 切换后回调 (tray tooltip 用)
-	onReceive      func(on bool)                                                   // 接收模式切换后回调 (main 起/关 receive webview)
-	onPeerIncoming func(fromName, fileName string, fileSize int64, token string)   // peer incoming ask 时弹 toast (按钮)
-	onPeerAccepted func(fromName, fileName string, fileSize int64)                 // peer incoming trusted 自动接受时弹纯通知
+	onSwap          func(newName string)                                            // 文件被 SwapFile 切换后回调 (tray tooltip 用)
+	onReceive       func(on bool)                                                   // 接收模式切换后回调 (main 起/关 receive webview)
+	onPeerIncoming  func(fromName, fileName string, fileSize int64, token string)   // peer incoming ask 时弹 toast (按钮)
+	onPeerAccepted  func(fromName, fileName string, fileSize int64)                 // peer incoming trusted 自动接受时弹纯通知
+	onPeerSent      func(toName, fileName string, fileSize int64)                   // 我作为 sender, 对端 Pull 完成时
+	onPeerReceived  func(fromName, fileName string, fileSize int64)                 // 我作为 receiver (ask 路径), Pull 完成时. trusted 路径不调 (已被 onPeerAccepted 告知)
+	onUploadDone    func(count int)                                                 // 手机 /upload 完成时
 	onPendingChange func(count int)                                                 // 待处理数变化后回调 (tray 红点+菜单显隐)
 }
 
@@ -102,11 +105,11 @@ type PeerSource interface {
 type PeerManager interface {
 	// Sender 端
 	CreateOutgoing(to PeerInfo, absPath, fileName string, fileSize int64) (token string, err error)
-	LookupOutgoing(token string) (absPath, fileName string, ok bool)
+	LookupOutgoing(token string) (absPath, fileName, toName string, fileSize int64, ok bool)
 	MarkDelivered(token string)
 	// Receiver 端
 	AddPending(token, fromUUID, fromName, fromHost, fromIPv4 string, fromPort int, fileName string, fileSize int64) error
-	LookupPending(token string) (fromIPv4 string, fromPort int, fileName string, fileSize int64, ok bool)
+	LookupPending(token string) (fromIPv4 string, fromPort int, fromName, fileName string, fileSize int64, ok bool)
 	SetPendingState(token, state string) bool
 	PendingList() []PendingEntry
 	PendingCount() int
@@ -283,6 +286,25 @@ func (s *Server) SetOnPeerIncoming(fn func(fromName, fileName string, fileSize i
 // 必须在 Start 之前调用.
 func (s *Server) SetOnPeerAccepted(fn func(fromName, fileName string, fileSize int64)) {
 	s.onPeerAccepted = fn
+}
+
+// SetOnPeerSent 注册"我作为发送方, 对端 Pull 完成"回调 (典型: 弹"已发送给 X" toast).
+// 必须在 Start 之前调用.
+func (s *Server) SetOnPeerSent(fn func(toName, fileName string, fileSize int64)) {
+	s.onPeerSent = fn
+}
+
+// SetOnPeerReceived 注册"我作为接收方 (ask 路径), Pull 完成"回调.
+// trusted 路径不调 (已由 onPeerAccepted 通知, 避免重复 toast).
+// 必须在 Start 之前调用.
+func (s *Server) SetOnPeerReceived(fn func(fromName, fileName string, fileSize int64)) {
+	s.onPeerReceived = fn
+}
+
+// SetOnUploadDone 注册"手机 /upload 完成"回调 (典型: 弹"已收到 N 个文件" toast).
+// 必须在 Start 之前调用.
+func (s *Server) SetOnUploadDone(fn func(count int)) {
+	s.onUploadDone = fn
 }
 
 // SetOnPendingChange 注册待处理数变化回调 (典型用法: tray.SetPendingCount).
@@ -647,12 +669,7 @@ func (s *Server) handlePeerIncoming(w http.ResponseWriter, r *http.Request) {
 	if trust == "trusted" {
 		// 信任设备: 立刻 accept + Pull. 弹纯通知 toast 告知 (无按钮).
 		s.peers.SetPendingState(body.Token, "accepted")
-		go s.pullPeerFile(body.Token, body.From.IPv4, body.From.Port, body.FileName, body.FileSize)
-		if s.onPeerIncoming != nil {
-			// onPeerIncoming 用 token 作为 hint, main 那边判断: trust=trusted 时调 IncomingSilent
-			// 但 server 不知道 main 的实现; 简单的做法: 复用 onPeerIncoming 传特殊 token "" 表示静默
-			// 这里改为新增一个 onPeerAccepted 回调.
-		}
+		go s.pullPeerFile(body.Token, body.From.IPv4, body.From.Port, body.From.Name, body.FileName, body.FileSize, true)
 		if s.onPeerAccepted != nil {
 			go s.onPeerAccepted(body.From.Name, body.FileName, body.FileSize)
 		}
@@ -683,7 +700,7 @@ func (s *Server) handlePeerFile(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	absPath, fileName, ok := s.peers.LookupOutgoing(token)
+	absPath, fileName, toName, fileSize, ok := s.peers.LookupOutgoing(token)
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -693,7 +710,10 @@ func (s *Server) handlePeerFile(w http.ResponseWriter, r *http.Request) {
 	// ServeFile 完成 (或 client 提前断开) 后标记交付; 下次同 token 失效.
 	// 真正"交付完成"无法 100% 知 (HTTP 不可靠), 但 token 一次性即可防重放.
 	s.peers.MarkDelivered(token)
-	log.Printf("peer Pull 完成: token=%s file=%s", token[:8], fileName)
+	log.Printf("peer Pull 完成: token=%s file=%s → %s", token[:8], fileName, toName)
+	if s.onPeerSent != nil {
+		go s.onPeerSent(toName, fileName, fileSize)
+	}
 }
 
 // handleInternalPeerSend POST /internal/peer-send : Alice 端 CLI/Vue 触发发文件给指定对端.
@@ -850,7 +870,7 @@ func (s *Server) handleInternalPeerDecide(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	fromIPv4, fromPort, fileName, fileSize, ok := s.peers.LookupPending(body.Token)
+	fromIPv4, fromPort, fromName, fileName, fileSize, ok := s.peers.LookupPending(body.Token)
 	if !ok {
 		http.Error(w, "token 未找到 (可能已过期)", http.StatusNotFound)
 		return
@@ -878,9 +898,9 @@ func (s *Server) handleInternalPeerDecide(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// accept: 异步 Pull
+	// accept: 异步 Pull (ask 路径, silent=false → 完成时弹 PeerReceived toast)
 	s.peers.SetPendingState(body.Token, "accepted")
-	go s.pullPeerFile(body.Token, fromIPv4, fromPort, fileName, fileSize)
+	go s.pullPeerFile(body.Token, fromIPv4, fromPort, fromName, fileName, fileSize, false)
 	s.emitPendingChange()
 	resp200JSON(w, map[string]string{"decision": "accepted", "pulling": "started"})
 }
@@ -921,7 +941,11 @@ func (s *Server) handleInternalDeviceTrust(w http.ResponseWriter, r *http.Reques
 
 // pullPeerFile 主动 GET 发送方的 /peer/file?token=xxx, 流式写到 Downloads/QuickDrop/.
 // 失败只打日志, 不重试 (用户可以再次 send).
-func (s *Server) pullPeerFile(token, fromIPv4 string, fromPort int, fileName string, fileSize int64) {
+//
+// silent=true 表示这是 trusted 设备触发的自动 accept (由 onPeerAccepted 通知),
+// 完成时不再弹 onPeerReceived toast 防重复.
+// silent=false (ask 路径用户手动接受) 完成时弹 onPeerReceived.
+func (s *Server) pullPeerFile(token, fromIPv4 string, fromPort int, fromName, fileName string, fileSize int64, silent bool) {
 	url := fmt.Sprintf("http://%s:%d/peer/file?token=%s", fromIPv4, fromPort, token)
 	client := &http.Client{Timeout: 30 * time.Minute} // 大文件慢传可能久
 	resp, err := client.Get(url)
@@ -947,7 +971,10 @@ func (s *Server) pullPeerFile(token, fromIPv4 string, fromPort int, fileName str
 		log.Printf("Pull 写入失败 (token=%s): %v", token[:8], err)
 		return
 	}
-	log.Printf("Pull peer 完成: %s (%d 字节)", finalPath, fileSize)
+	log.Printf("Pull peer 完成: %s (%d 字节) silent=%v", finalPath, fileSize, silent)
+	if !silent && s.onPeerReceived != nil {
+		go s.onPeerReceived(fromName, fileName, fileSize)
+	}
 }
 
 func resp200JSON(w http.ResponseWriter, v any) {
@@ -1099,6 +1126,11 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `<!doctype html><html lang="zh-CN"><meta charset="utf-8">`+
 		`<title>QuickDrop</title><body style="font-family:system-ui;text-align:center;padding:40px;">`+
 		`<h1>已收到 %d 个文件</h1><p>保存到 ~/Downloads/QuickDrop/</p></body></html>`, count)
+
+	// 弹电脑端 toast 让用户知道 (用户可能在浏览器之外, 没看 daemon 日志)
+	if count > 0 && s.onUploadDone != nil {
+		go s.onUploadDone(count)
+	}
 }
 
 // validateFile 把用户给的路径 (相对/绝对都行) 检查 + 描述化.

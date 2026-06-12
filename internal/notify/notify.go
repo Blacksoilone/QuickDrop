@@ -66,6 +66,59 @@ func IncomingSilent(fromName, fileName string, fileSize int64) {
 	}
 }
 
+// PeerSent 发送方视角: 对端 Pull 完了我推过去的文件.
+// 弹一条 "已发送 X 给 Y" 让用户知道传完了 (不至于一直猜对面收没收到).
+func PeerSent(toName, fileName string, fileSize int64) {
+	if toName == "" {
+		toName = "对端"
+	}
+	n := toast.Notification{
+		AppID:    appID,
+		Title:    fmt.Sprintf("已发送给 %s", toName),
+		Message:  fmt.Sprintf("%s (%s)", fileName, humanSize(fileSize)),
+		Duration: toast.Short,
+		Audio:    toast.Default,
+	}
+	if err := n.Push(); err != nil {
+		log.Printf("toast (peer-sent) 推送失败: %v", err)
+	}
+}
+
+// PeerReceived 接收方视角: 已经把对端推过来的文件保存到本地.
+// 仅 ask 路径调 (trusted 路径已被 IncomingSilent 告知, 不重复弹).
+func PeerReceived(fromName, fileName string, fileSize int64) {
+	if fromName == "" {
+		fromName = "对端"
+	}
+	n := toast.Notification{
+		AppID:    appID,
+		Title:    fmt.Sprintf("已收到 来自 %s", fromName),
+		Message:  fmt.Sprintf("%s (%s) 已保存到 ~/Downloads/QuickDrop/", fileName, humanSize(fileSize)),
+		Duration: toast.Short,
+		Audio:    toast.Default,
+	}
+	if err := n.Push(); err != nil {
+		log.Printf("toast (peer-received) 推送失败: %v", err)
+	}
+}
+
+// UploadDone 手机上传完成时弹: 用户在电脑端可能正干别的, 通知一下.
+func UploadDone(count int) {
+	if count <= 0 {
+		return
+	}
+	n := toast.Notification{
+		AppID:    appID,
+		Title:    "QuickDrop 接收完成",
+		Message:  fmt.Sprintf("已收到 %d 个文件, 保存到 ~/Downloads/QuickDrop/", count),
+		Duration: toast.Short,
+		Audio:    toast.Default,
+	}
+	if err := n.Push(); err != nil {
+		log.Printf("toast (upload-done) 推送失败: %v", err)
+	}
+}
+
 func humanSize(n int64) string {
 	const unit = 1024
 	if n < unit {

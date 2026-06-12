@@ -141,7 +141,7 @@ func (m *Manager) CreateOutgoing(to PeerInfo, absPath, fileName string, fileSize
 	}, nil
 }
 
-// LookupOutgoing 由 /peer/file handler 调: 验证 token 取出本地文件路径.
+// LookupOutgoing 由 /peer/file handler 调: 验证 token 取出本地文件路径 + 收件方信息.
 // 返回 ok=false 表示 token 错或已 Delivered (防重放).
 func (m *Manager) LookupOutgoing(token string) (*Outgoing, bool) {
 	m.mu.RLock()

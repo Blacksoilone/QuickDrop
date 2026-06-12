@@ -400,6 +400,15 @@ func runDaemon(initialPath string, initialReceive bool) {
 	srv.SetOnPeerAccepted(func(fromName, fileName string, fileSize int64) {
 		notify.IncomingSilent(fromName, fileName, fileSize)
 	})
+	srv.SetOnPeerSent(func(toName, fileName string, fileSize int64) {
+		notify.PeerSent(toName, fileName, fileSize)
+	})
+	srv.SetOnPeerReceived(func(fromName, fileName string, fileSize int64) {
+		notify.PeerReceived(fromName, fileName, fileSize)
+	})
+	srv.SetOnUploadDone(func(count int) {
+		notify.UploadDone(count)
+	})
 	srv.SetOnPendingChange(func(count int) {
 		tray.SetPendingCount(count)
 	})
@@ -521,12 +530,12 @@ func (a peerMgrAdapter) CreateOutgoing(to server.PeerInfo, absPath, fileName str
 	return o.Token, nil
 }
 
-func (a peerMgrAdapter) LookupOutgoing(token string) (absPath, fileName string, ok bool) {
+func (a peerMgrAdapter) LookupOutgoing(token string) (absPath, fileName, toName string, fileSize int64, ok bool) {
 	o, ok := a.m.LookupOutgoing(token)
 	if !ok {
-		return "", "", false
+		return "", "", "", 0, false
 	}
-	return o.AbsPath, o.FileName, true
+	return o.AbsPath, o.FileName, o.To.Name, o.FileSize, true
 }
 
 func (a peerMgrAdapter) MarkDelivered(token string) { a.m.MarkDelivered(token) }
@@ -542,12 +551,12 @@ func (a peerMgrAdapter) AddPending(token, fromUUID, fromName, fromHost, fromIPv4
 	})
 }
 
-func (a peerMgrAdapter) LookupPending(token string) (fromIPv4 string, fromPort int, fileName string, fileSize int64, ok bool) {
+func (a peerMgrAdapter) LookupPending(token string) (fromIPv4 string, fromPort int, fromName, fileName string, fileSize int64, ok bool) {
 	p := a.m.LookupPending(token)
 	if p == nil {
-		return "", 0, "", 0, false
+		return "", 0, "", "", 0, false
 	}
-	return p.From.IPv4, p.From.Port, p.FileName, p.FileSize, true
+	return p.From.IPv4, p.From.Port, p.From.Name, p.FileName, p.FileSize, true
 }
 
 func (a peerMgrAdapter) SetPendingState(token, state string) bool {
