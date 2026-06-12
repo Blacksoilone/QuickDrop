@@ -84,6 +84,7 @@ type Manager struct {
 	mu       sync.RWMutex
 	outgoing map[string]*Outgoing // key = token
 	pending  map[string]*Pending  // key = token
+	onChange func()               // 任何 state 变化后触发 (add/setState/gc), tray 红点用
 }
 
 func NewManager() *Manager {
@@ -94,6 +95,24 @@ func NewManager() *Manager {
 	// 后台 GC, 30 秒扫一次清过期项
 	go m.gcLoop()
 	return m
+}
+
+// SetOnChange 注册 pending/outgoing 变化回调. 调用频率: 每次 add/setState/gc.
+// 回调里只该读 PendingCount 等 cheap 操作, 别阻塞.
+func (m *Manager) SetOnChange(fn func()) {
+	m.mu.Lock()
+	m.onChange = fn
+	m.mu.Unlock()
+}
+
+// fireChange 内部帮手, 持锁外调.
+func (m *Manager) fireChange() {
+	m.mu.RLock()
+	cb := m.onChange
+	m.mu.RUnlock()
+	if cb != nil {
+		cb()
+	}
 }
 
 // CreateOutgoing 由 Sender 调: 生成 token 注册 outgoing, 返回 Incoming 让调用方 POST 给对端.
@@ -148,8 +167,8 @@ func (m *Manager) MarkDelivered(token string) {
 // 返回 error 表示 token 冲突 (理论上 32hex 不可能, 但兜底).
 func (m *Manager) AddPending(inc Incoming) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if _, dup := m.pending[inc.Token]; dup {
+		m.mu.Unlock()
 		return errors.New("token 已存在")
 	}
 	m.pending[inc.Token] = &Pending{
@@ -157,6 +176,8 @@ func (m *Manager) AddPending(inc Incoming) error {
 		State:    StatePending,
 		ArriveAt: time.Now(),
 	}
+	m.mu.Unlock()
+	m.fireChange()
 	return nil
 }
 
@@ -175,13 +196,15 @@ func (m *Manager) LookupPending(token string) *Pending {
 // 不删, 留给 gc, UI 端能看到 "已接受" / "已拒绝" 几秒.
 func (m *Manager) SetPendingState(token string, s State) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	p, ok := m.pending[token]
-	if !ok {
-		return false
+	if ok {
+		p.State = s
 	}
-	p.State = s
-	return true
+	m.mu.Unlock()
+	if ok {
+		m.fireChange()
+	}
+	return ok
 }
 
 // PendingList 返回所有 pending 项的快照 (按到达时间, 新的在前).
@@ -222,14 +245,17 @@ func (m *Manager) gcLoop() {
 	defer tick.Stop()
 	for range tick.C {
 		now := time.Now()
+		changed := false
 		m.mu.Lock()
 		for t, p := range m.pending {
 			if p.State == StatePending && now.Sub(p.ArriveAt) > pendingTTL {
 				p.State = StateExpired
+				changed = true
 			}
 			// 已决策/过期的 1 小时后彻底删
 			if p.State != StatePending && now.Sub(p.ArriveAt) > pendingTTL+time.Hour {
 				delete(m.pending, t)
+				changed = true
 			}
 		}
 		for t, o := range m.outgoing {
@@ -240,6 +266,9 @@ func (m *Manager) gcLoop() {
 			}
 		}
 		m.mu.Unlock()
+		if changed {
+			m.fireChange()
+		}
 	}
 }
 

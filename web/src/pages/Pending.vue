@@ -1,0 +1,270 @@
+<script setup lang="ts">
+// 待处理 incoming 列表页 (托盘 "待处理 (N)" 点开走这里).
+// 列出 pending 队列, 每条可接受/拒绝. 接受后 daemon 异步 Pull 文件.
+import { onMounted, onUnmounted, ref } from "vue";
+import {
+  closeWindow,
+  decidePeer,
+  fetchPending,
+  type PendingEntry,
+} from "../api";
+
+const items = ref<PendingEntry[]>([]);
+const error = ref<string>("");
+let timer: number | undefined;
+
+onMounted(async () => {
+  await refresh();
+  // 每 2 秒刷新, 让状态变化 (accepted/rejected) 反映出来
+  timer = window.setInterval(refresh, 2000);
+});
+
+onUnmounted(() => {
+  if (timer !== undefined) window.clearInterval(timer);
+});
+
+async function refresh() {
+  try {
+    items.value = await fetchPending();
+    error.value = "";
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+
+async function accept(p: PendingEntry) {
+  try {
+    await decidePeer(p.token, "accept");
+    await refresh();
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+
+async function reject(p: PendingEntry) {
+  try {
+    await decidePeer(p.token, "reject");
+    await refresh();
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+
+function humanSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let i = 0;
+  let v = n / 1024;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(1)} ${units[i]}`;
+}
+
+function stateLabel(s: PendingEntry["state"]): string {
+  switch (s) {
+    case "pending":
+      return "等待你决策";
+    case "accepted":
+      return "已接受 (正在下载)";
+    case "rejected":
+      return "已拒绝";
+    case "expired":
+      return "已超时";
+  }
+}
+</script>
+
+<template>
+  <button class="close" title="关闭窗口 (daemon 继续运行)" @click="closeWindow">×</button>
+  <div class="wrap">
+    <h1>待处理文件传入</h1>
+
+    <div v-if="error" class="err">无法加载: {{ error }}</div>
+
+    <div v-if="items.length === 0 && !error" class="empty">
+      当前没有待处理的传入<br />
+      <span class="hint">收到新邀请时会弹 toast 通知, 也会自动出现在这里</span>
+    </div>
+
+    <ul class="list">
+      <li v-for="p in items" :key="p.token" :class="['item', `state-${p.state}`]">
+        <div class="meta">
+          <div class="name">{{ p.fileName }}</div>
+          <div class="sub">
+            来自 <b>{{ p.from.name }}</b> · {{ humanSize(p.fileSize) }} ·
+            <span class="state">{{ stateLabel(p.state) }}</span>
+          </div>
+        </div>
+        <div class="actions" v-if="p.state === 'pending'">
+          <button class="btn accept" @click="accept(p)">接受</button>
+          <button class="btn reject" @click="reject(p)">拒绝</button>
+        </div>
+      </li>
+    </ul>
+  </div>
+</template>
+
+<style scoped>
+html,
+body,
+:global(html),
+:global(body) {
+  width: 100%;
+  height: 100%;
+}
+.wrap {
+  width: 100%;
+  min-height: 100vh;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+}
+h1 {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: #444;
+}
+.empty {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  color: #999;
+  font-size: 13px;
+  text-align: center;
+  line-height: 1.8;
+}
+.empty .hint {
+  font-size: 11px;
+  color: #bbb;
+}
+.err {
+  color: #d33;
+  font-size: 12px;
+  text-align: center;
+  margin-bottom: 8px;
+}
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.item {
+  background: #fff;
+  border: 1px solid #e5e5e5;
+  border-left: 3px solid #0066ff;
+  border-radius: 4px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.item.state-accepted {
+  border-left-color: #2a7;
+  opacity: 0.7;
+}
+.item.state-rejected,
+.item.state-expired {
+  border-left-color: #999;
+  opacity: 0.5;
+}
+.meta {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.name {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sub {
+  font-size: 11px;
+  color: #888;
+  margin-top: 2px;
+}
+.sub b {
+  color: #555;
+  font-weight: 600;
+}
+.state {
+  font-weight: 500;
+}
+.actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.btn {
+  padding: 4px 12px;
+  border: 0;
+  border-radius: 3px;
+  font-size: 12px;
+  cursor: pointer;
+  color: #fff;
+}
+.btn.accept {
+  background: #0066ff;
+}
+.btn.accept:hover {
+  background: #0055d4;
+}
+.btn.reject {
+  background: #c33;
+}
+.btn.reject:hover {
+  background: #a22;
+}
+.close {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  line-height: 20px;
+  text-align: center;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font-size: 16px;
+  color: #888;
+  border-radius: 4px;
+}
+.close:hover {
+  background: #e5e5e5;
+  color: #333;
+}
+@media (prefers-color-scheme: dark) {
+  h1 {
+    color: #ccc;
+  }
+  .item {
+    background: #262626;
+    border-color: #333;
+  }
+  .sub {
+    color: #999;
+  }
+  .sub b {
+    color: #ccc;
+  }
+  .empty {
+    color: #777;
+  }
+  .empty .hint {
+    color: #555;
+  }
+  .close:hover {
+    background: #333;
+    color: #fff;
+  }
+}
+</style>

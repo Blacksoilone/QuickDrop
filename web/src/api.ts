@@ -29,6 +29,35 @@ export async function fetchPeers(): Promise<Peer[]> {
   return r.json();
 }
 
+// /api/pending 返回的待处理 incoming.
+export interface PendingEntry {
+  token: string;
+  state: "pending" | "accepted" | "rejected" | "expired";
+  from: Peer;
+  fileName: string;
+  fileSize: number;
+  arriveAt: number; // Unix 秒
+}
+
+export async function fetchPending(): Promise<PendingEntry[]> {
+  const r = await fetch("/api/pending", { cache: "no-store" });
+  if (!r.ok) throw new Error(`/api/pending ${r.status}`);
+  return r.json();
+}
+
+// 决策一条 incoming: accept 触发 daemon 异步 Pull, reject 仅改状态.
+export async function decidePeer(token: string, decision: "accept" | "reject"): Promise<void> {
+  const r = await fetch("/internal/peer-decide", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, decision }),
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`peer-decide ${r.status}: ${txt}`);
+  }
+}
+
 // 给 daemon 发 IPC: 把 daemon 当前的发送文件发给指定 UUID 对端.
 // daemon 自己 POST 对端 /peer/incoming, 触发对端 toast.
 // filePath 不传, daemon 用自己的 s.absPath (Vue 不需要也不该知道绝对路径).

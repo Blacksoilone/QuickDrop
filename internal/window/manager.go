@@ -52,6 +52,7 @@ type Manager struct {
 	keepCmds  []*exec.Cmd // ModeKeep 持有所有发送窗子进程 (退出时一并清理)
 	firstUsed bool        // ModeFirstOnly 记是否已经开过发送窗
 	recvCmd   *exec.Cmd   // 接收窗子进程 (独立于 mode, 单实例)
+	pendCmd   *exec.Cmd   // pending dashboard 子进程 (单实例; 用户从托盘点开)
 }
 
 // NewManager 创建一个 Manager. mode 决定 OpenForFile 的行为.
@@ -120,6 +121,27 @@ func (m *Manager) Shutdown() {
 	if m.recvCmd != nil && m.recvCmd.Process != nil {
 		_ = m.recvCmd.Process.Kill()
 	}
+	if m.pendCmd != nil && m.pendCmd.Process != nil {
+		_ = m.pendCmd.Process.Kill()
+	}
+}
+
+// OpenPendingWindow 起一个 pending dashboard 子进程 (单实例).
+// 用户从托盘点 "待处理 (N)" 时调. 重复点会先杀旧的避免堆积.
+func (m *Manager) OpenPendingWindow(url string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pendCmd != nil && m.pendCmd.Process != nil {
+		if err := m.pendCmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			log.Printf("杀旧 pending 窗 (PID %d) 失败: %v", m.pendCmd.Process.Pid, err)
+		}
+	}
+	cmd, err := spawn(m.selfExe, url)
+	if err != nil {
+		log.Printf("打开 pending webview 子进程失败: %v", err)
+		return
+	}
+	m.pendCmd = cmd
 }
 
 // OpenReceiveWindow 起一个接收 dashboard 子进程. 单实例.

@@ -144,6 +144,19 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
   - uninstall 同步清除 URL scheme 4 个子键 (scheme/shell/open/command 链)
   - test-toast.ps1 16 checks ALL PASS (URL scheme 注册/卸载/url-action CLI 调 daemon 全流程)
   - **限制**: 实际 toast 弹出需肉眼验证 (无法自动截图判别 Action Center 内容), 调用链已通过编译 + url-action IPC 已验证
+- [x] **任务 2.5e 红点 fallback** (Phase 2.5 完结, ADR-19 兜底):
+  - tray 加 `SetPendingCount(n)` 同步 tooltip + 菜单项 + 图标三处:
+    - tooltip: 当前文件名后追加 "N 个待处理"
+    - 菜单项: "待处理 (N)" 默认隐藏, n>0 显示并改文字
+    - 图标: 切到 icon-alert.ico (蓝底右上角小红方块)
+  - server 加 `SetOnPendingChange` 回调, AddPending/SetPendingState/gcLoop 都触发
+  - peer.Manager 加 `SetOnChange` 回调机制 (gc 过期 expire 时也通知)
+  - 新路由 `/p` 服务 Vue pending dashboard, 不受 receiveMode 门禁
+  - 新 Vue 页 `web/src/pages/Pending.vue`: 列出所有 incoming, 每条 [接受][拒绝], 2 秒轮询刷新
+  - main.go 接 tray 的 onPending 回调 → winMgr.OpenPendingWindow(baseURL + "/p") 起子进程
+  - window.Manager 加 `OpenPendingWindow` 单实例字段 pendCmd
+  - test-pending.ps1 12 checks ALL PASS: /p 可达 + pending count 变化 + reject 状态变化
+  - **托盘红点 + tooltip 切换 + 菜单显隐是 GUI 行为, 需肉眼验证**
 
 ## 4. 遇到的问题
 
@@ -160,14 +173,16 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
 
 ## 5. 待办
 
-### 下一步 — 2.5d/e + 2.6
+### 下一步 — 2.6 设备记忆 + 信任升级
 
-按 [QuickDrop.md §6 Phase 2.5](./QuickDrop.md):
+按 [QuickDrop.md §6 Phase 2.6](./QuickDrop.md):
 
-- **2.5d** `quickdrop accept --id` / `reject --id` 独立子命令 (现状: 已通过 `url-action` 子命令实现等价功能, 可能此项已不需要单独做; 看是否要把 url-action 重命名)
-- **2.5e** 红点 fallback: 托盘菜单 "待处理 (N)" + `/pending` Vue 页面 + 托盘 "发送到 X" 二级菜单
+- `~/.quickdrop/devices.json` 记录交互过的设备及是否"信任"
+- 配置页 / `/p` 加 "信任此设备" 复选框, 勾上后该设备发文件:
+  - toast 仍弹但 3 秒后自动接受 (中途用户可点"拒绝"撤销)
+- "永不信任" 黑名单, 黑名单内设备直接 reject
 
-完成后下一步是 **2.6 设备记忆 + 信任升级**: `~/.quickdrop/devices.json` + "信任此设备" 复选框.
+Phase 2.5 全套交付 (a-e + Dashboard 双视图) ✅. PC↔PC 互传从设计到 UI 闭环, v0.9.0 是个自然的发布节点.
 
 ### 后续 Phase 2 顺位
 

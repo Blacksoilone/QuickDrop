@@ -25,6 +25,7 @@ export default defineConfig({
         d: resolve(__dirname, "d.html"),
         r: resolve(__dirname, "r.html"),
         u: resolve(__dirname, "u.html"),
+        p: resolve(__dirname, "p.html"),
       },
     },
   },

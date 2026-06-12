@@ -80,9 +80,10 @@ type Server struct {
 	myUUID string
 	myName string
 
-	onSwap         func(newName string)                              // 文件被 SwapFile 切换后回调 (tray tooltip 用)
-	onReceive      func(on bool)                                     // 接收模式切换后回调 (main 起/关 receive webview)
-	onPeerIncoming func(fromName, fileName string, fileSize int64, token string) // peer incoming 到达后回调 (弹 toast)
+	onSwap         func(newName string)                                            // 文件被 SwapFile 切换后回调 (tray tooltip 用)
+	onReceive      func(on bool)                                                   // 接收模式切换后回调 (main 起/关 receive webview)
+	onPeerIncoming func(fromName, fileName string, fileSize int64, token string)   // peer incoming 到达后回调 (弹 toast)
+	onPendingChange func(count int)                                                 // 待处理数变化后回调 (tray 红点+菜单显隐)
 }
 
 // PeerSource 注入接口, server 通过它拉发现到的对端列表 (避免 server 直接依赖 discovery 包).
@@ -104,6 +105,8 @@ type PeerManager interface {
 	SetPendingState(token, state string) bool
 	PendingList() []PendingEntry
 	PendingCount() int
+	// 通知层
+	SetOnChange(fn func()) // pending/outgoing 变化时触发 (gc 也算), 给 server 用于 emitPendingChange
 }
 
 // PeerInfo 与 internal/peer.PeerInfo 同结构, server 包独立定义避免循环.
@@ -253,6 +256,22 @@ func (s *Server) SetOnPeerIncoming(fn func(fromName, fileName string, fileSize i
 	s.onPeerIncoming = fn
 }
 
+// SetOnPendingChange 注册待处理数变化回调 (典型用法: tray.SetPendingCount).
+// AddPending / SetPendingState / GC expire 都会触发.
+// 必须在 Start 之前调用.
+func (s *Server) SetOnPendingChange(fn func(count int)) {
+	s.onPendingChange = fn
+}
+
+// emitPendingChange 在 peer manager 状态可能变化后调用.
+// 拉最新 pending count 传给回调. 由 handlePeerIncoming / handleInternalPeerDecide 等触发.
+func (s *Server) emitPendingChange() {
+	if s.onPendingChange == nil || s.peers == nil {
+		return
+	}
+	s.onPendingChange(s.peers.PendingCount())
+}
+
 // SwapFile 把当前发送文件切换成 rawPath. 并发安全.
 // 用于 IPC: 第二次 quickdrop send Y 不重启进程, 直接更新这里.
 func (s *Server) SwapFile(rawPath string) error {
@@ -280,6 +299,11 @@ func (s *Server) Start() {
 	}
 	cleanupStaleTmp()
 
+	// 把 peer manager 的变化也桥到 emitPendingChange (gc 过期项时也要刷新 tray)
+	if s.peers != nil {
+		s.peers.SetOnChange(s.emitPendingChange)
+	}
+
 	mux := http.NewServeMux()
 	// 发送侧路由 (无文件时 404)
 	mux.HandleFunc("/file", s.handleFile)
@@ -291,6 +315,8 @@ func (s *Server) Start() {
 	mux.HandleFunc("/r", s.handleReceiveDashboard)
 	mux.HandleFunc("/u", s.handleUploadForm)
 	mux.HandleFunc("/upload", s.handleUpload)
+	// Peer 待处理列表 dashboard (Vue), 不受 receiveMode 门禁 (PC→PC 走另一套路)
+	mux.HandleFunc("/p", s.handlePendingDashboard)
 	// JSON API (Vue 前端拉服务状态)
 	mux.HandleFunc("/api/info", s.handleAPIInfo)
 	mux.HandleFunc("/api/peers", s.handleAPIPeers)
@@ -427,6 +453,13 @@ func (s *Server) handleUploadForm(w http.ResponseWriter, r *http.Request) {
 	s.serveDistFile(w, r, "u.html")
 }
 
+// handlePendingDashboard /p : 待处理 incoming 列表页 (Vue).
+// daemon 弹独立 webview 子窗加载这里. 不受 receiveMode 门禁
+// (待处理跟接收模式独立, PC→PC 是单独的安全模型).
+func (s *Server) handlePendingDashboard(w http.ResponseWriter, r *http.Request) {
+	s.serveDistFile(w, r, "p.html")
+}
+
 // serveDistFile 从嵌入的 web/dist 读取文件, 加 no-store 防手机缓存看到旧文件名.
 func (s *Server) serveDistFile(w http.ResponseWriter, r *http.Request, name string) {
 	data, err := fs.ReadFile(s.dist, name)
@@ -529,6 +562,8 @@ func (s *Server) handlePeerIncoming(w http.ResponseWriter, r *http.Request) {
 	if s.onPeerIncoming != nil {
 		go s.onPeerIncoming(body.From.Name, body.FileName, body.FileSize, body.Token)
 	}
+	// 通知 tray 更新红点 + 菜单 + tooltip (2.5e fallback)
+	s.emitPendingChange()
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("queued"))
@@ -719,6 +754,7 @@ func (s *Server) handleInternalPeerDecide(w http.ResponseWriter, r *http.Request
 	if body.Decision == "reject" {
 		s.peers.SetPendingState(body.Token, "rejected")
 		log.Printf("拒绝 peer 邀请 token=%s file=%s", body.Token[:8], fileName)
+		s.emitPendingChange()
 		resp200JSON(w, map[string]string{"decision": "rejected"})
 		return
 	}
@@ -726,6 +762,7 @@ func (s *Server) handleInternalPeerDecide(w http.ResponseWriter, r *http.Request
 	// accept: 异步 Pull
 	s.peers.SetPendingState(body.Token, "accepted")
 	go s.pullPeerFile(body.Token, fromIPv4, fromPort, fileName, fileSize)
+	s.emitPendingChange()
 	resp200JSON(w, map[string]string{"decision": "accepted", "pulling": "started"})
 }
 

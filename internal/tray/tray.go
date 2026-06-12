@@ -6,6 +6,7 @@ package tray
 
 import (
 	_ "embed"
+	"fmt"
 	"log"
 	"sync"
 
@@ -17,14 +18,23 @@ import (
 // 把 PNG 直接传进去会得到 "Unable to set icon: The operation completed successfully."
 //
 //go:embed icon.ico
-var iconBytes []byte
+var iconNormalBytes []byte
+
+// 待处理 incoming > 0 时切换的红点图标. 蓝底右上角小红方块.
+//
+//go:embed icon-alert.ico
+var iconAlertBytes []byte
 
 // receiveItem: 模块级保存接收菜单项, 给 SetReceiveChecked 外部同步用.
+// pendingItem: 模块级保存 "待处理 (N)" 菜单项, 给 SetPendingCount 改文本+显隐用.
 // systray 没有暴露按 id 拿菜单项的 API, 只能这样.
-// 用 mu 保护避免 Run 还没建好菜单时 SetReceiveChecked 拿到 nil.
+// 用 mu 保护避免 Run 还没建好菜单时外部 setter 拿到 nil.
 var (
-	receiveMu   sync.Mutex
-	receiveItem *systray.MenuItem
+	stateMu      sync.Mutex
+	receiveItem  *systray.MenuItem
+	pendingItem  *systray.MenuItem
+	currentName  string // 当前文件名 (tooltip 用)
+	pendingCount int    // 当前待处理数 (tooltip 用)
 )
 
 // Run 启动托盘 (阻塞), 直到用户点 "退出" 或 systray.Quit() 被外部触发.
@@ -32,20 +42,28 @@ var (
 // shareURL:    给朋友的链接 (mobileURL, 指向 /d 手机端发送页). "复制扫码链接" 复制这个.
 // initialName: 初始发送的文件名, 显示在 tooltip 上.
 // onReceive:   用户点 "接收文件" / "停止接收" 时调 (传入新状态 on/off).
-//              由 main 接到 server.EnableReceive.
+// onPending:   用户点 "待处理 (N)" 时调 (main 起 pending webview 子窗加载 /p).
 // onExit:      用户点退出时调用 (典型用法: server.Shutdown()).
 //              onExit 在 systray.Quit() 之后, 进程返回前执行.
-func Run(shareURL, initialName string, onReceive func(on bool), onExit func()) {
+func Run(shareURL, initialName string, onReceive func(on bool), onPending func(), onExit func()) {
 	onReady := func() {
-		systray.SetIcon(iconBytes)
+		systray.SetIcon(iconNormalBytes)
 		systray.SetTitle("QuickDrop")
-		systray.SetTooltip(tooltipFor(initialName))
+		stateMu.Lock()
+		currentName = initialName
+		stateMu.Unlock()
+		systray.SetTooltip(buildTooltip())
 
 		mCopy := systray.AddMenuItem("复制扫码链接", "把 "+shareURL+" 写到剪贴板")
 		mRecv := systray.AddMenuItemCheckbox("接收文件", "开启接收模式, 弹接收 QR 窗", false)
-		receiveMu.Lock()
+		mPend := systray.AddMenuItem("待处理 (0)", "查看待接受/拒绝的文件传入")
+		mPend.Hide() // 默认隐藏, 有 pending 时显示
+
+		stateMu.Lock()
 		receiveItem = mRecv
-		receiveMu.Unlock()
+		pendingItem = mPend
+		stateMu.Unlock()
+
 		systray.AddSeparator()
 		mQuit := systray.AddMenuItem("退出", "停止 server 并退出")
 
@@ -70,6 +88,10 @@ func Run(shareURL, initialName string, onReceive func(on bool), onExit func()) {
 							onReceive(true)
 						}
 					}
+				case <-mPend.ClickedCh:
+					if onPending != nil {
+						onPending()
+					}
 				case <-mQuit.ClickedCh:
 					systray.Quit()
 					return
@@ -86,8 +108,8 @@ func Run(shareURL, initialName string, onReceive func(on bool), onExit func()) {
 //
 // 在 systray.Run 起来之前调是 no-op (没事, 因为初值就是 false).
 func SetReceiveChecked(checked bool) {
-	receiveMu.Lock()
-	defer receiveMu.Unlock()
+	stateMu.Lock()
+	defer stateMu.Unlock()
 	if receiveItem == nil {
 		return
 	}
@@ -102,12 +124,52 @@ func SetReceiveChecked(checked bool) {
 // systray.SetTooltip 是包级函数, 可在任意 goroutine 调用, 但必须在 systray.Run
 // 起来之后才会生效. SwapFile 由 HTTP handler 触发, 此时 systray 必已 onReady.
 func UpdateTooltip(fileName string) {
-	systray.SetTooltip(tooltipFor(fileName))
+	stateMu.Lock()
+	currentName = fileName
+	stateMu.Unlock()
+	systray.SetTooltip(buildTooltip())
 }
 
-func tooltipFor(fileName string) string {
-	if fileName == "" {
-		return "QuickDrop - 局域网文件传输"
+// SetPendingCount 让外部 (server peer 状态机回调) 同步待处理数.
+// n > 0 时: tooltip 加 "N 个待处理", 菜单项显示并改文字, 图标切红点版.
+// n = 0 时: tooltip 恢复, 菜单项隐藏, 图标恢复正常.
+func SetPendingCount(n int) {
+	stateMu.Lock()
+	pendingCount = n
+	mItem := pendingItem
+	stateMu.Unlock()
+
+	systray.SetTooltip(buildTooltip())
+
+	if n > 0 {
+		systray.SetIcon(iconAlertBytes)
+		if mItem != nil {
+			mItem.SetTitle(fmt.Sprintf("待处理 (%d)", n))
+			mItem.Show()
+		}
+	} else {
+		systray.SetIcon(iconNormalBytes)
+		if mItem != nil {
+			mItem.Hide()
+		}
 	}
-	return "QuickDrop - 正在发送: " + fileName
+}
+
+// buildTooltip 拼装 tooltip 文本. 持锁外读 state, 调用者保证.
+func buildTooltip() string {
+	stateMu.Lock()
+	name := currentName
+	n := pendingCount
+	stateMu.Unlock()
+
+	base := "QuickDrop"
+	if name != "" {
+		base = "QuickDrop - 正在发送: " + name
+	} else {
+		base = "QuickDrop - 局域网文件传输"
+	}
+	if n > 0 {
+		base += fmt.Sprintf(" · %d 个待处理", n)
+	}
+	return base
 }

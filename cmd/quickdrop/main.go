@@ -387,6 +387,9 @@ func runDaemon(initialPath string, initialReceive bool) {
 	srv.SetOnPeerIncoming(func(fromName, fileName string, fileSize int64, token string) {
 		notify.Incoming(fromName, fileName, fileSize, token)
 	})
+	srv.SetOnPendingChange(func(count int) {
+		tray.SetPendingCount(count)
+	})
 
 	// mDNS: 广播自己 + 发现局域网内其他 QuickDrop. 失败不致命.
 	disc, err := discovery.Start(ident.UUID, ident.Name, version, port)
@@ -435,7 +438,13 @@ func runDaemon(initialPath string, initialReceive bool) {
 		srv.EnableReceive(on)
 	}
 
-	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, func() {
+	// 托盘 "待处理 (N)" 菜单点击 → 起 pending dashboard 子窗 (单实例)
+	pendingURL := srv.HomeURL()[:len(srv.HomeURL())-1] + "/p" // baseURL/p
+	onTrayPending := func() {
+		winMgr.OpenPendingWindow(pendingURL)
+	}
+
+	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, onTrayPending, func() {
 		if disc != nil {
 			disc.Close()
 		}
@@ -546,6 +555,9 @@ func (a peerMgrAdapter) PendingList() []server.PendingEntry {
 }
 
 func (a peerMgrAdapter) PendingCount() int { return a.m.PendingCount() }
+
+// SetOnChange 转发到底层 peer.Manager. main 用它把 server.emitPendingChange 接到 tray.
+func (a peerMgrAdapter) SetOnChange(fn func()) { a.m.SetOnChange(fn) }
 
 func setupLogging() {
 	logPath := filepath.Join(os.TempDir(), "quickdrop.log")
