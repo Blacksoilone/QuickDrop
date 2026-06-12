@@ -176,7 +176,8 @@ func runDaemon(absPath string) {
 
 	// systray.Run 阻塞 + 必须在 main goroutine.
 	// 用户点 "退出" → onExit 关 HTTP server + 杀所有 webview 子进程 → systray.Run 返回 → 进程退出.
-	tray.Run(srv.HomeURL(), srv.CurrentFileName(), func() {
+	// shareURL 用 mobileURL (指向 /d 手机端发送页), 给朋友复制走的就该是这个.
+	tray.Run(srv.MobileURL(), srv.CurrentFileName(), func() {
 		winMgr.Shutdown()
 		srv.Shutdown()
 	})

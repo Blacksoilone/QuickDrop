@@ -20,17 +20,17 @@ var iconBytes []byte
 
 // Run 启动托盘 (阻塞), 直到用户点 "退出" 或 systray.Quit() 被外部触发.
 //
-// homeURL:     用于 "复制扫码链接" 菜单项写入剪贴板.
+// shareURL:    给朋友的链接 (mobileURL, 指向 /d 手机端发送页). "复制扫码链接" 复制这个.
 // initialName: 初始发送的文件名, 显示在 tooltip 上.
 // onExit:      用户点退出时调用 (典型用法: server.Shutdown()).
 //              onExit 在 systray.Quit() 之后, 进程返回前执行.
-func Run(homeURL, initialName string, onExit func()) {
+func Run(shareURL, initialName string, onExit func()) {
 	onReady := func() {
 		systray.SetIcon(iconBytes)
 		systray.SetTitle("QuickDrop")
 		systray.SetTooltip(tooltipFor(initialName))
 
-		mCopy := systray.AddMenuItem("复制扫码链接", "把 "+homeURL+" 写到剪贴板")
+		mCopy := systray.AddMenuItem("复制扫码链接", "把 "+shareURL+" 写到剪贴板")
 		systray.AddSeparator()
 		mQuit := systray.AddMenuItem("退出", "停止 server 并退出")
 
@@ -38,10 +38,10 @@ func Run(homeURL, initialName string, onExit func()) {
 			for {
 				select {
 				case <-mCopy.ClickedCh:
-					if err := clipboard.WriteAll(homeURL); err != nil {
+					if err := clipboard.WriteAll(shareURL); err != nil {
 						log.Printf("复制到剪贴板失败: %v", err)
 					} else {
-						log.Printf("已复制: %s", homeURL)
+						log.Printf("已复制: %s", shareURL)
 					}
 				case <-mQuit.ClickedCh:
 					systray.Quit()

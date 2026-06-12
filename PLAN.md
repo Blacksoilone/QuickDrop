@@ -55,6 +55,15 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 - [x] **任务 2.1** 拆包:`cmd/quickdrop` + `internal/{server,qr,tray,window}`(见 §2)
 - [x] **任务 2.2 + 2.3** Daemon + IPC:第二次 `quickdrop send Y` 不重启进程,POST `/internal/send` 让运行中的 daemon 切换文件。`/internal/*` 由 `requireLocal` 限制只 127.0.0.1 可访问,LAN 一律 404。tooltip 自动跟随当前文件。`test-daemon-switch.ps1` 自动 PASS
 - [x] **任务 2.10** WebView2 小窗:daemon fork `quickdrop window <url>` 子进程,WebView2 280×320 固定大小加载主页 QR。删除"自动开浏览器"(ADR-11 真正落地)。子进程独立 main goroutine 避开 systray/webview 消息循环冲突。三种 window-mode(replace/keep/first-only)由 `QUICKDROP_WINDOW_MODE` env 控制,`test-window.ps1` 自动 PASS
+- [x] **任务 2.11 + 2.10 UI 收尾** (ADR-17 极简 UI):
+  - templates 拆三套:dashboardHTMLTpl(电脑端) / downloadHTMLTpl(手机 `/d`) / uploadHTMLTpl(`/u` 占位待 2.13)
+  - `/` 极简 dashboard:只渲 QR + 文件名 + 大小 + 关闭按钮,固定 264×316 窗口
+  - `/d` 手机端发送目标页:文件图标 SVG + 文件名 + 大小 + 下载按钮,**没有 QR**
+  - `/qr` 编码改为 `mobileURL` (=`baseURL/d`),手机扫码进手机页
+  - `/upload` 加 `receiveMode atomic.Bool` 门禁,默认 false → 404 (ADR-17 安全约束)
+  - 托盘"复制扫码链接"复制 `mobileURL` (给朋友的链接)
+  - 路由语义自动验证:`/`无上传无下载、`/d`无 QR 有下载、`/upload POST`默认 404、`/qr`仍 200 PNG
+  - 像素采样验证窗口外观:QR 完整(851 黑像素)、无右侧滚动条(右边纯白)、尺寸贴合(279×353 含标题栏)
 
 ## 4. 遇到的问题
 
