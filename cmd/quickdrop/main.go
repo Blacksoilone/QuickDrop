@@ -457,7 +457,13 @@ func runDaemon(initialPath string, initialReceive bool) {
 		winMgr.OpenPendingWindow(pendingURL)
 	}
 
-	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, onTrayPending, func() {
+	// 托盘 "设备管理" 菜单点击 → 起 devices dashboard 子窗 (单实例)
+	devicesURL := srv.HomeURL()[:len(srv.HomeURL())-1] + "/v" // baseURL/v
+	onTrayDevices := func() {
+		winMgr.OpenDevicesWindow(devicesURL)
+	}
+
+	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, onTrayPending, onTrayDevices, func() {
 		if disc != nil {
 			disc.Close()
 		}

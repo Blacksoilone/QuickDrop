@@ -53,6 +53,7 @@ type Manager struct {
 	firstUsed bool        // ModeFirstOnly 记是否已经开过发送窗
 	recvCmd   *exec.Cmd   // 接收窗子进程 (独立于 mode, 单实例)
 	pendCmd   *exec.Cmd   // pending dashboard 子进程 (单实例; 用户从托盘点开)
+	devCmd    *exec.Cmd   // devices dashboard 子进程 (单实例; 用户从托盘 "设备管理" 点开)
 }
 
 // NewManager 创建一个 Manager. mode 决定 OpenForFile 的行为.
@@ -124,6 +125,9 @@ func (m *Manager) Shutdown() {
 	if m.pendCmd != nil && m.pendCmd.Process != nil {
 		_ = m.pendCmd.Process.Kill()
 	}
+	if m.devCmd != nil && m.devCmd.Process != nil {
+		_ = m.devCmd.Process.Kill()
+	}
 }
 
 // OpenPendingWindow 起一个 pending dashboard 子进程 (单实例).
@@ -142,6 +146,24 @@ func (m *Manager) OpenPendingWindow(url string) {
 		return
 	}
 	m.pendCmd = cmd
+}
+
+// OpenDevicesWindow 起一个 devices dashboard 子进程 (单实例).
+// 用户从托盘点 "设备管理" 时调.
+func (m *Manager) OpenDevicesWindow(url string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.devCmd != nil && m.devCmd.Process != nil {
+		if err := m.devCmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			log.Printf("杀旧 devices 窗 (PID %d) 失败: %v", m.devCmd.Process.Pid, err)
+		}
+	}
+	cmd, err := spawn(m.selfExe, url)
+	if err != nil {
+		log.Printf("打开 devices webview 子进程失败: %v", err)
+		return
+	}
+	m.devCmd = cmd
 }
 
 // OpenReceiveWindow 起一个接收 dashboard 子进程. 单实例.
