@@ -44,7 +44,7 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 - [x] **任务 1.4** 系统托盘:`getlantern/systray` + `atotto/clipboard`,菜单"复制扫码链接"/"退出",删掉 Phase 1 自动开浏览器代码(ADR-11)
 - [x] **任务 1.5** 命令行:`flag` 包,支持 `send <path>` 显式语法 + 拖拽单参数
 - [x] **任务 1.6** `/upload`:`MultipartReader` 流式 + 临时文件 + rename,中文文件名 RFC 5987 编码
-- [x] **任务 1.7 准备就绪**:`build.ps1`、`TEST.md`、固件脚本、用例 5 自动化通过。手动用例 1/2/3/4/6 待你跑(见 TEST.md)
+- [x] **任务 1.7 验收**:用例 1-5 全部 ✅,用例 6(多手机并发)缺设备暂缓。Phase 1 实质完成
 - [x] **任务 2.1** 拆包:`cmd/quickdrop` + `internal/{server,qr,tray}`(见 §2)
 
 ## 4. 遇到的问题
@@ -60,14 +60,31 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 
 ## 5. 待办
 
-### 任务 1.7 — 手动验收
+### Phase 2 启动 — 2.2 + 2.3 Daemon + IPC (最优先)
 
-跑一遍 [TEST.md](./TEST.md) 里的 6 项,其中:
-- ☑ 用例 5(临时文件清理)已 `.\test\test-crash-cleanup.ps1` 自动 PASS
-- ☐ 用例 1/2/3/4/6 需要真手机扫码
+**痛点**:程序已启动时,再次 `quickdrop.exe send X` 会因端口 8443 占用失败。每次发文件都要手动关上次的进程,违背"无感"。
 
-**Phase 1 完成标志**:全 6 项 ✅,能放心把 .exe 给一个朋友说"扫码就能给我发文件"。
+**做法**(QuickDrop.md §6 Phase 2 已规划):
+- 第二次启动检测 daemon 已跑 → POST `http://127.0.0.1:8443/internal/send` body=新文件路径
+- 现有 daemon 切换当前发送文件,命令行进程立即退出(exit 0)
+- 托盘 tooltip + 主页内容同步刷新
 
-### 后续(Phase 2 才做)
+预期 ~50 行,纯 HTTP 自打自,不引 Named Pipe。
+
+### 待补验收
+
+- ⏸ TEST.md 用例 6 多手机并发(等借到第二台手机)
+
+### 后续 Phase 2
+
+- 2.10 WebView2 小窗(替代浏览器,ADR-11"无感")
+- 2.11 UI 分化(`/d` `/u` 路由拆分)
+- 2.7 Vue 工程化
+- 2.4 Windows 右键菜单
+- 2.5 / 2.6 / 2.8 / 2.9 视优先级
+
+详情见 [QuickDrop.md §6](./QuickDrop.md)。
+
+### 后续(Phase 2 才做的小项)
 
 托盘图标用绘图软件画一个像样的(目前是纯蓝 16x16 占位),Phase 2.10 WebView2 小窗实装时一并替换。

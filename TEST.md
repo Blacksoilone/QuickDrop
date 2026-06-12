@@ -3,6 +3,9 @@
 > 6 项验收用例。
 > 走完且全部 ✅ 即可宣布 Phase 1 完成,把 .exe 给朋友试。
 
+**当前状态(2026-06-12)**: 用例 1-5 已通过,用例 6 因没有第二台手机暂时挂起。
+Phase 1 实质完成,等用例 6 设备齐了再补勾。
+
 ## 准备
 
 ```powershell
@@ -33,7 +36,7 @@
 
 ## 验收用例
 
-### ☐ 1. 小图(<1MB)发送
+### ☑ 1. 小图(<1MB)发送
 
 ```powershell
 .\quickdrop.exe send test.png
@@ -45,7 +48,7 @@
 - ☐ 手机点"下载" → 收到完整 PNG, 大小 1,141,522 字节
 - ☐ 点托盘"退出" → 任务管理器 5 秒内看不到 quickdrop.exe
 
-### ☐ 2. 大文件(>500MB)发送
+### ☑ 2. 大文件(>500MB)发送
 
 ```powershell
 .\quickdrop.exe send .\test\big.bin
@@ -56,7 +59,7 @@
 - ☐ 下载过程中电脑 quickdrop.exe **内存稳定**(任务管理器查, 不应随传输线性增长)
 - ☐ 下载完整后, 手机端 MD5 与 `Get-FileHash .\test\big.bin` 一致
 
-### ☐ 3. 中文文件名发送
+### ☑ 3. 中文文件名发送
 
 ```powershell
 .\quickdrop.exe send .\test\你好世界.png
@@ -65,7 +68,7 @@
 - ☐ 主页"下载到此设备"区域文件名显示 `你好世界.png` (不乱码)
 - ☐ 手机端浏览器下载保存的文件名也是 `你好世界.png` (验证 RFC 5987)
 
-### ☐ 4. 中文文件名上传
+### ☑ 4. 中文文件名上传
 
 任意状态 `quickdrop.exe send ...` 启动后:
 
@@ -84,7 +87,7 @@
 原理: 启动一个 server, 发起大上传, 中途 `Stop-Process -Force` 杀掉, 检查 `Downloads\QuickDrop` 留 `.tmp`. 然后重启 server, 期望启动清理把 `.tmp` 清掉。
 注: 残留 `.tmp` 不是 bug, 是 OS 强杀必然结果 — 修复策略是**下次启动时清扫**, 见 server.go `cleanupStaleTmp`。
 
-### ☐ 6. 多手机并发
+### ⏸ 6. 多手机并发 (暂缓: 缺第二台手机)
 
 `quickdrop.exe send test.png` 启动后:
 
