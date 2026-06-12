@@ -26,12 +26,27 @@ const (
 	menuKeyPath    = `Software\Classes\*\shell\QuickDrop`
 	commandSubKey  = `command`
 	menuLabel      = "通过 QuickDrop 发送"
+
+	// schemeKeyPath quickdrop:// URL scheme handler 注册位置 (ADR-19).
+	// 用于 toast 通知按钮 quickdrop://accept?token=xxx / reject?token=xxx,
+	// 点击后 Windows 启动我们的 exe 带上 URL 参数.
+	schemeKeyPath = `Software\Classes\quickdrop`
 )
 
-// Install 写入注册表, 让 Windows 右键文件菜单出现 "通过 QuickDrop 发送".
+// Install 写入注册表, 让 Windows 右键文件菜单出现 "通过 QuickDrop 发送" + 注册 quickdrop:// URL scheme.
 // exePath 必须是绝对路径 (不会自动 abs, 调用者负责).
 // 幂等: 已存在会覆盖, 不报错.
 func Install(exePath string) error {
+	if err := installContextMenu(exePath); err != nil {
+		return err
+	}
+	if err := installURLScheme(exePath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func installContextMenu(exePath string) error {
 	// 1. 主键: HKCU\Software\Classes\*\shell\QuickDrop
 	key, _, err := registry.CreateKey(registry.CURRENT_USER, menuKeyPath, registry.ALL_ACCESS)
 	if err != nil {
@@ -56,27 +71,71 @@ func Install(exePath string) error {
 	defer cmdKey.Close()
 
 	// command 值格式: "C:\path\to\quickdrop.exe" send "%1"
-	// 双引号包路径处理空格 + %1 是 Windows shell 传给我们的文件路径
 	cmd := fmt.Sprintf(`"%s" send "%%1"`, exePath)
 	if err := cmdKey.SetStringValue("", cmd); err != nil {
 		return fmt.Errorf("写 command 失败: %w", err)
 	}
-
 	return nil
 }
 
-// Uninstall 删除注册表中右键菜单条目. 幂等: 不存在不报错.
-// 必须先删 command 子键再删主键.
+// installURLScheme 注册 quickdrop:// URL scheme.
+//
+//   HKCU\Software\Classes\quickdrop
+//     (默认)        = "URL:QuickDrop Protocol"
+//     URL Protocol  = "" (空字符串, 标记这是 URL scheme)
+//     \shell\open\command\(默认) = "<exe>" url-action "%1"
+//
+// 用户在浏览器/toast 按钮点 quickdrop://accept?token=xxx → Windows 启动:
+//   "<exe>" url-action "quickdrop://accept?token=xxx"
+func installURLScheme(exePath string) error {
+	root, _, err := registry.CreateKey(registry.CURRENT_USER, schemeKeyPath, registry.ALL_ACCESS)
+	if err != nil {
+		return fmt.Errorf("创建 scheme 主键失败: %w", err)
+	}
+	defer root.Close()
+	if err := root.SetStringValue("", "URL:QuickDrop Protocol"); err != nil {
+		return fmt.Errorf("写 scheme 描述失败: %w", err)
+	}
+	// "URL Protocol" 必须存在 (即使是空字符串), 这是 Windows 识别 URL scheme 的标志
+	if err := root.SetStringValue("URL Protocol", ""); err != nil {
+		return fmt.Errorf("写 URL Protocol 标志失败: %w", err)
+	}
+
+	cmdKey, _, err := registry.CreateKey(registry.CURRENT_USER, schemeKeyPath+`\shell\open\command`, registry.ALL_ACCESS)
+	if err != nil {
+		return fmt.Errorf("创建 scheme command 子键失败: %w", err)
+	}
+	defer cmdKey.Close()
+	cmd := fmt.Sprintf(`"%s" url-action "%%1"`, exePath)
+	if err := cmdKey.SetStringValue("", cmd); err != nil {
+		return fmt.Errorf("写 scheme command 失败: %w", err)
+	}
+	return nil
+}
+
+// Uninstall 删除注册表中右键菜单 + URL scheme. 幂等: 不存在不报错.
 func Uninstall() error {
-	// 先删 command 子键
+	// 先删 command 子键再删主键 (registry.DeleteKey 不递归)
 	if err := registry.DeleteKey(registry.CURRENT_USER, menuKeyPath+`\`+commandSubKey); err != nil &&
 		err != registry.ErrNotExist {
 		return fmt.Errorf("删 command 子键失败: %w", err)
 	}
-	// 再删主键
 	if err := registry.DeleteKey(registry.CURRENT_USER, menuKeyPath); err != nil &&
 		err != registry.ErrNotExist {
 		return fmt.Errorf("删主键失败: %w", err)
+	}
+
+	// URL scheme 子键链: scheme\shell\open\command → scheme\shell\open → scheme\shell → scheme
+	for _, sub := range []string{
+		schemeKeyPath + `\shell\open\command`,
+		schemeKeyPath + `\shell\open`,
+		schemeKeyPath + `\shell`,
+		schemeKeyPath,
+	} {
+		if err := registry.DeleteKey(registry.CURRENT_USER, sub); err != nil &&
+			err != registry.ErrNotExist {
+			return fmt.Errorf("删 %s 失败: %w", sub, err)
+		}
 	}
 	return nil
 }
@@ -94,4 +153,15 @@ func IsInstalled() (bool, string) {
 		return false, ""
 	}
 	return true, val
+}
+
+// IsURLSchemeInstalled 返回 quickdrop:// URL scheme 是否已注册.
+func IsURLSchemeInstalled() bool {
+	key, err := registry.OpenKey(registry.CURRENT_USER, schemeKeyPath+`\shell\open\command`, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer key.Close()
+	_, _, err = key.GetStringValue("")
+	return err == nil
 }

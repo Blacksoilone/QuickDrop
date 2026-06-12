@@ -135,6 +135,15 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
     - POST `/internal/peer-decide` (Bob IPC): accept → 异步 Pull, reject → 改状态
   - server 新增 GET `/api/pending` Vue 端拉待决策列表
   - test-peer.ps1 21 checks ALL PASS (双 daemon Alice→Bob 全流程: 邀请/接受/Pull/MD5 一致/token 一次性/reject)
+- [x] **任务 2.5c Toast 通知 + URL scheme** (ADR-19):
+  - 新包 `internal/notify`: 基于 go-toast, 弹原生 Windows 10/11 toast 含 [接受] [拒绝] 按钮
+  - install 同时注册 `HKCU\Software\Classes\quickdrop` URL scheme (新 internal/installer/registry.go::installURLScheme)
+    - quickdrop://accept?token=xxx / quickdrop://reject?token=xxx → 启动 `quickdrop.exe url-action "<url>"`
+  - main.go 新增 `url-action` 子命令: 解析 URL 后 POST /internal/peer-decide
+  - server.SetOnPeerIncoming 回调: handlePeerIncoming 收到后异步触发 notify.Incoming 弹 toast
+  - uninstall 同步清除 URL scheme 4 个子键 (scheme/shell/open/command 链)
+  - test-toast.ps1 16 checks ALL PASS (URL scheme 注册/卸载/url-action CLI 调 daemon 全流程)
+  - **限制**: 实际 toast 弹出需肉眼验证 (无法自动截图判别 Action Center 内容), 调用链已通过编译 + url-action IPC 已验证
 
 ## 4. 遇到的问题
 
@@ -151,13 +160,12 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
 
 ## 5. 待办
 
-### 下一步 — 继续推 2.5c–e + 2.6
+### 下一步 — 2.5d/e + 2.6
 
 按 [QuickDrop.md §6 Phase 2.5](./QuickDrop.md):
 
-- **2.5c** Toast 通知 (ADR-19): `go-toast` 弹按钮 toast, install 注册 `quickdrop://` URL scheme
-- **2.5d** `quickdrop accept --id` / `reject --id` 子命令: URL 触发 → 调 /internal/peer-decide
-- **2.5e** 红点 fallback: 托盘菜单 "待处理 (N)" + `/pending` Vue 页面
+- **2.5d** `quickdrop accept --id` / `reject --id` 独立子命令 (现状: 已通过 `url-action` 子命令实现等价功能, 可能此项已不需要单独做; 看是否要把 url-action 重命名)
+- **2.5e** 红点 fallback: 托盘菜单 "待处理 (N)" + `/pending` Vue 页面 + 托盘 "发送到 X" 二级菜单
 
 完成后下一步是 **2.6 设备记忆 + 信任升级**: `~/.quickdrop/devices.json` + "信任此设备" 复选框.
 

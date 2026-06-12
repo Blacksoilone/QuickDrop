@@ -26,6 +26,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,6 +36,7 @@ import (
 	"quickdrop/internal/discovery"
 	"quickdrop/internal/identity"
 	"quickdrop/internal/installer"
+	"quickdrop/internal/notify"
 	"quickdrop/internal/peer"
 	"quickdrop/internal/server"
 	"quickdrop/internal/tray"
@@ -117,6 +119,19 @@ func main() {
 		return
 	}
 
+	// url-action 子命令: Windows shell 把 quickdrop:// URL 启动转给我们 (toast 按钮点击).
+	// 格式: quickdrop.exe url-action "quickdrop://accept?token=xxx"
+	// 我们解析 URL → POST /internal/peer-decide → 退出.
+	if len(os.Args) >= 2 && os.Args[1] == "url-action" {
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: quickdrop url-action <quickdrop://...>")
+			os.Exit(1)
+		}
+		setupLogging()
+		runURLAction(os.Args[2])
+		return
+	}
+
 	// install / uninstall / status 子命令: 直接看 os.Args, 不走 flag.Parse,
 	// 避免 -q 被 flag 包当成未定义 flag 拒绝.
 	if len(os.Args) >= 2 {
@@ -157,6 +172,42 @@ func main() {
 		os.Exit(1)
 	}
 	runSend(rawPath)
+}
+
+// runURLAction 处理 quickdrop:// URL scheme 启动 (toast action 点击触发).
+// URL: quickdrop://accept?token=xxx 或 quickdrop://reject?token=xxx
+// 行为: POST /internal/peer-decide → 立即退出, daemon 那边异步 Pull 文件.
+func runURLAction(raw string) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		log.Fatalf("URL 解析失败: %v (raw=%s)", err, raw)
+	}
+	if u.Scheme != "quickdrop" {
+		log.Fatalf("非 quickdrop:// URL: %s", raw)
+	}
+	decision := u.Host // "accept" 或 "reject"
+	if decision != "accept" && decision != "reject" {
+		log.Fatalf("未知 URL action: %s (应为 accept 或 reject)", decision)
+	}
+	token := u.Query().Get("token")
+	if token == "" {
+		log.Fatal("URL 缺 token 参数")
+	}
+	log.Printf("URL action: decision=%s token=%s", decision, token[:8])
+
+	// POST /internal/peer-decide
+	body := fmt.Sprintf(`{"token":%q,"decision":%q}`, token, decision)
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Post(daemonURL()+"/internal/peer-decide", "application/json", strings.NewReader(body))
+	if err != nil {
+		log.Fatalf("通知 daemon 失败: %v (daemon 没在跑?)", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		log.Fatalf("daemon 返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(rb)))
+	}
+	log.Printf("daemon 已确认 %s, 退出", decision)
 }
 
 // parseSendArgs 支持两种形态:
@@ -326,6 +377,9 @@ func runDaemon(initialPath string, initialReceive bool) {
 	srv.SetDist(distFS)
 	srv.SetIdentity(ident.UUID, ident.Name)
 	srv.SetPeerManager(peerMgrAdapter{peer.NewManager()})
+	srv.SetOnPeerIncoming(func(fromName, fileName string, fileSize int64, token string) {
+		notify.Incoming(fromName, fileName, fileSize, token)
+	})
 
 	// mDNS: 广播自己 + 发现局域网内其他 QuickDrop. 失败不致命.
 	disc, err := discovery.Start(ident.UUID, ident.Name, version, port)

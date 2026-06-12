@@ -80,8 +80,9 @@ type Server struct {
 	myUUID string
 	myName string
 
-	onSwap    func(newName string) // 文件被 SwapFile 切换后回调 (tray tooltip 用)
-	onReceive func(on bool)        // 接收模式切换后回调 (main 起/关 receive webview)
+	onSwap         func(newName string)                              // 文件被 SwapFile 切换后回调 (tray tooltip 用)
+	onReceive      func(on bool)                                     // 接收模式切换后回调 (main 起/关 receive webview)
+	onPeerIncoming func(fromName, fileName string, fileSize int64, token string) // peer incoming 到达后回调 (弹 toast)
 }
 
 // PeerSource 注入接口, server 通过它拉发现到的对端列表 (避免 server 直接依赖 discovery 包).
@@ -244,6 +245,12 @@ func (s *Server) SetPeerManager(pm PeerManager) {
 func (s *Server) SetIdentity(uuid, name string) {
 	s.myUUID = uuid
 	s.myName = name
+}
+
+// SetOnPeerIncoming 注册 peer incoming 到达回调 (典型用法: 弹 toast).
+// 必须在 Start 之前调用.
+func (s *Server) SetOnPeerIncoming(fn func(fromName, fileName string, fileSize int64, token string)) {
+	s.onPeerIncoming = fn
 }
 
 // SwapFile 把当前发送文件切换成 rawPath. 并发安全.
@@ -517,6 +524,12 @@ func (s *Server) handlePeerIncoming(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("收到 peer 邀请: %s 想发 %s (%d 字节) token=%s", body.From.Name, body.FileName, body.FileSize, body.Token[:8])
+
+	// 异步弹 toast (ADR-19). 不阻塞 HTTP 200 返回给对端.
+	if s.onPeerIncoming != nil {
+		go s.onPeerIncoming(body.From.Name, body.FileName, body.FileSize, body.Token)
+	}
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("queued"))
 }
