@@ -44,7 +44,7 @@ Check "/ 含 <img src=`"/qr`">" ($html -match '<img src="/qr"')
 Check "/ 含文件名 test.png" ($html -match 'test\.png')
 Check "/ 无 href=`"/file`" (电脑端不下载给自己)" (-not ($html -match 'href="/file"'))
 Check "/ 无 <form action=`"/upload`"> (电脑端无上传)" (-not ($html -match '<form action="/upload"'))
-Check "/ 含关闭按钮 (window.close)" ($html -match 'window\.close')
+Check "/ 含关闭按钮 (quickdropClose)" ($html -match 'quickdropClose')
 
 Write-Host ""
 Write-Host "=== /d 手机端发送页: 文件图标 + 信息 + 下载, 无 QR ===" -ForegroundColor Cyan

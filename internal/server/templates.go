@@ -135,6 +135,7 @@ const downloadHTMLTpl = `<!doctype html>
 </html>`
 
 // uploadHTMLTpl 手机端接收模式上传页 (Phase 2.13).
+// form action="/upload" → POST /upload, 受 receiveMode 门禁.
 const uploadHTMLTpl = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -153,11 +154,11 @@ const uploadHTMLTpl = `<!doctype html>
     }
     h1 { font-size: 1.1em; margin: 0 0 16px; }
     input[type=file] {
-      width: 100%%; margin-bottom: 16px; padding: 10px;
+      width: 100%; margin-bottom: 16px; padding: 10px;
       background: #fafafa; border: 1px dashed #ccc; border-radius: 8px;
     }
     .btn {
-      display: block; width: 100%%; padding: 14px;
+      display: block; width: 100%; padding: 14px;
       background: #0066ff; color: #fff; border: 0; border-radius: 8px;
       font-size: 1em; font-weight: 600;
     }
@@ -178,6 +179,74 @@ const uploadHTMLTpl = `<!doctype html>
     </form>
     <p class="hint">保存到 ~/Downloads/QuickDrop/</p>
   </div>
+</body>
+</html>`
+
+// receiveDashboardHTMLTpl 电脑端接收模式 dashboard (ADR-17 + 2.13).
+// 只显示接收 QR + 提示 + 停止接收按钮.
+// "停止接收": fetch /internal/receive off → quickdropClose() 关窗 → daemon 注销 /u.
+const receiveDashboardHTMLTpl = `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QuickDrop - 接收</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%; height: 100%;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      color: #1a1a1a; background: #fafafa;
+      overflow: hidden;
+    }
+    .wrap {
+      width: 100%; height: 100%;
+      display: flex; flex-direction: column; align-items: center;
+      padding: 12px 12px 10px;
+    }
+    .qr {
+      width: 220px; height: 220px;
+      background: #fff; padding: 6px; border-radius: 6px;
+      flex: 0 0 auto;
+    }
+    .qr img { width: 100%; height: 100%; display: block; }
+    .hint {
+      margin-top: 8px; font-size: 12px; color: #555; text-align: center;
+    }
+    .stop {
+      margin-top: 10px; padding: 6px 14px;
+      background: #d33; color: #fff; border: 0; border-radius: 4px;
+      font-size: 12px; cursor: pointer;
+    }
+    .stop:hover { background: #b22; }
+    .close {
+      position: absolute; top: 4px; right: 6px;
+      width: 22px; height: 22px; line-height: 20px; text-align: center;
+      border: 0; background: transparent; cursor: pointer;
+      font-size: 16px; color: #888; border-radius: 4px;
+    }
+    .close:hover { background: #e5e5e5; color: #333; }
+    @media (prefers-color-scheme: dark) {
+      html, body { color: #eee; background: #1a1a1a; }
+      .hint { color: #aaa; }
+      .close:hover { background: #333; color: #fff; }
+    }
+  </style>
+</head>
+<body>
+  <button class="close" onclick="quickdropClose()" title="关闭窗口 (接收仍开启)">×</button>
+  <div class="wrap">
+    <div class="qr"><img src="/qr-recv" alt="扫码上传"></div>
+    <div class="hint">手机扫码上传文件<br>保存到 ~/Downloads/QuickDrop/</div>
+    <button class="stop" onclick="stopReceive()">停止接收</button>
+  </div>
+  <script>
+    function stopReceive() {
+      fetch('/internal/receive', {method:'POST', body:'off'})
+        .finally(() => quickdropClose());
+    }
+  </script>
 </body>
 </html>`
 

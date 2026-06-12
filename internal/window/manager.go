@@ -45,12 +45,13 @@ func ParseMode(s string) Mode {
 
 // Manager 由 daemon 进程持有. fork/kill webview 子进程.
 type Manager struct {
-	mu       sync.Mutex
-	mode     Mode
-	selfExe  string         // os.Executable() 的结果, fork 用
-	cur      *exec.Cmd      // ModeReplace 持有当前子进程
-	keepCmds []*exec.Cmd    // ModeKeep 持有所有子进程 (退出时一并清理)
-	firstUsed bool          // ModeFirstOnly 记是否已经开过窗
+	mu        sync.Mutex
+	mode      Mode
+	selfExe   string      // os.Executable() 的结果, fork 用
+	cur       *exec.Cmd   // ModeReplace 持有当前发送窗子进程
+	keepCmds  []*exec.Cmd // ModeKeep 持有所有发送窗子进程 (退出时一并清理)
+	firstUsed bool        // ModeFirstOnly 记是否已经开过发送窗
+	recvCmd   *exec.Cmd   // 接收窗子进程 (独立于 mode, 单实例)
 }
 
 // NewManager 创建一个 Manager. mode 决定 OpenForFile 的行为.
@@ -116,6 +117,40 @@ func (m *Manager) Shutdown() {
 			_ = c.Process.Kill()
 		}
 	}
+	if m.recvCmd != nil && m.recvCmd.Process != nil {
+		_ = m.recvCmd.Process.Kill()
+	}
+}
+
+// OpenReceiveWindow 起一个接收 dashboard 子进程. 单实例.
+// 若已存在 (用户连续多次点"接收文件"), 先杀旧的.
+func (m *Manager) OpenReceiveWindow(url string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.recvCmd != nil && m.recvCmd.Process != nil {
+		if err := m.recvCmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			log.Printf("杀旧接收窗 (PID %d) 失败: %v", m.recvCmd.Process.Pid, err)
+		}
+	}
+	cmd, err := spawn(m.selfExe, url)
+	if err != nil {
+		log.Printf("打开接收 webview 子进程失败: %v", err)
+		return
+	}
+	m.recvCmd = cmd
+}
+
+// CloseReceiveWindow 关掉接收窗子进程 (如果在跑).
+// 由 server.EnableReceive(false) 回调触发.
+func (m *Manager) CloseReceiveWindow() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.recvCmd != nil && m.recvCmd.Process != nil {
+		if err := m.recvCmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			log.Printf("关闭接收窗 (PID %d) 失败: %v", m.recvCmd.Process.Pid, err)
+		}
+	}
+	m.recvCmd = nil
 }
 
 // spawn fork 一个 `<selfExe> window <url>` 子进程, 立刻返回不等它结束.

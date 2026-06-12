@@ -1,13 +1,20 @@
 // Package server hosts the QuickDrop HTTP routes
-// (/, /d, /file, /qr, /upload) plus internal IPC routes
-// (/internal/health, /internal/send).
+// (/, /d, /r, /u, /file, /qr, /qr-recv, /upload) plus internal IPC routes
+// (/internal/health, /internal/send, /internal/receive).
 //
 // ADR-17 路由职责:
-//   /        电脑端 webview 弹窗加载的 dashboard, 只渲 QR + 文件名/大小 + 关闭键
-//   /d       手机端发送目标页 (手机扫 QR 进的就是这里), 文件图标 + 信息 + 下载
-//   /qr      PNG QR, 编码 baseURL + /d
-//   /file    实际文件下载, http.ServeFile
-//   /upload  接收端上传, 默认 404 (ADR-17 安全约束), 由 EnableReceive(true) 开启
+//   /         电脑端发送模式 dashboard, 只渲 QR + 文件名/大小 + 关闭键
+//   /d        手机端发送目标页 (扫 /qr 进的是这里), 文件图标 + 信息 + 下载
+//   /qr       PNG QR, 编码 baseURL + /d (发送模式)
+//   /file     实际文件下载, http.ServeFile
+//   /r        电脑端接收模式 dashboard, 只渲 QR + 提示 + 停止接收键
+//   /u        手机端上传表单页 (扫 /qr-recv 进的是这里)
+//   /qr-recv  PNG QR, 编码 baseURL + /u (接收模式)
+//   /upload   实际接收上传, 默认 404 (ADR-17 安全约束), 由 EnableReceive(true) 开启
+//
+// 路由默认行为:
+//   发送/下载/QR 类路由: 没文件时 (纯接收模式启动) 返回 404, 防泄露
+//   /r /u /qr-recv:      不依赖文件, 始终可用 (但 /u 也受 receiveMode 门禁, 关时 404)
 //
 // 单进程 daemon 模式: 第一次 quickdrop send X 起 daemon, 后续 send Y 走 IPC
 // 切换当前发送文件, 命令行立即退出. 见 cmd/quickdrop/main.go.
@@ -36,9 +43,10 @@ import (
 // 一次进程一个 Server, 通过 New + Start/Shutdown 管理生命周期.
 //
 // 当前发送文件 (absPath/fileName/fileSize) 用 mu 保护, SwapFile 可在运行中替换.
+// 纯接收模式启动时 absPath 为空, 发送类路由返回 404.
 type Server struct {
 	mu       sync.RWMutex
-	absPath  string // 待发送文件的绝对路径
+	absPath  string // 待发送文件的绝对路径; "" 表示纯接收模式
 	fileName string // 文件名 (展示+下载头用)
 	fileSize string // 人类可读大小
 
@@ -47,52 +55,76 @@ type Server struct {
 	// 往本机塞文件, 上传仅在接收模式开启时可用.
 	receiveMode atomic.Bool
 
-	homeURL   string // 电脑端 dashboard URL (webview 加载 + 内部用)
-	mobileURL string // 手机端发送目标 URL (QR 编码 + 托盘 "复制扫码链接" 复制)
-	baseURL   string // http://<lan>:8443
-	httpSrv   *http.Server
+	homeURL    string // 电脑端发送 dashboard URL
+	receiveURL string // 电脑端接收 dashboard URL
+	mobileURL  string // 手机端发送目标 URL (QR 编码 + 托盘 "复制扫码链接" 复制)
+	uploadURL  string // 手机端上传 URL (接收模式 QR 编码)
+	baseURL    string // http://<lan>:8443
+	httpSrv    *http.Server
 
-	onSwap func(newName string) // 文件被 SwapFile 切换后回调 (tray tooltip 用)
+	onSwap    func(newName string) // 文件被 SwapFile 切换后回调 (tray tooltip 用)
+	onReceive func(on bool)        // 接收模式切换后回调 (main 起/关 receive webview)
 }
 
-// New 验证文件可读, 探测 LAN IP, 装配 Server.
+// New 装配 Server. rawPath 为空表示纯接收模式启动 (daemon 启动时无文件可发).
 // 不启动 listener.
 func New(rawPath string) (*Server, error) {
-	absPath, name, size, err := validateFile(rawPath)
-	if err != nil {
-		return nil, err
-	}
-
 	lanIP := getLANIP()
 	if lanIP == "" {
 		return nil, fmt.Errorf("没找到对外 LAN IP, 检查网卡和路由")
 	}
 
 	baseURL := fmt.Sprintf("http://%s:8443", lanIP)
-	return &Server{
-		absPath:   absPath,
-		fileName:  name,
-		fileSize:  size,
-		homeURL:   baseURL + "/",
-		mobileURL: baseURL + "/d",
-		baseURL:   baseURL,
-	}, nil
+	s := &Server{
+		homeURL:    baseURL + "/",
+		receiveURL: baseURL + "/r",
+		mobileURL:  baseURL + "/d",
+		uploadURL:  baseURL + "/u",
+		baseURL:    baseURL,
+	}
+
+	if rawPath != "" {
+		absPath, name, size, err := validateFile(rawPath)
+		if err != nil {
+			return nil, err
+		}
+		s.absPath = absPath
+		s.fileName = name
+		s.fileSize = size
+	}
+	return s, nil
 }
 
-// HomeURL 电脑端 dashboard URL. webview 加载用.
+// HomeURL 电脑端发送模式 dashboard URL. webview 加载用.
 func (s *Server) HomeURL() string { return s.homeURL }
+
+// ReceiveURL 电脑端接收模式 dashboard URL. 接收 webview 加载用.
+func (s *Server) ReceiveURL() string { return s.receiveURL }
 
 // MobileURL 手机端发送目标 URL. 托盘 "复制扫码链接" 复制这个 (给朋友扫/打开).
 func (s *Server) MobileURL() string { return s.mobileURL }
 
-// EnableReceive 开/关接收模式 (是否注册 /upload). ADR-17 安全约束.
-// Phase 2.13 才会真正被调用; 当前默认 false.
+// HasFile 当前是否有可发送的文件. 用于 main 决定要不要开发送窗.
+func (s *Server) HasFile() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.absPath != ""
+}
+
+// EnableReceive 开/关接收模式 (是否真正接受 /upload 上传). ADR-17 安全约束.
+// 触发 onReceive 回调让 main 起/关 receive webview.
 func (s *Server) EnableReceive(on bool) {
 	prev := s.receiveMode.Swap(on)
 	if prev != on {
 		log.Printf("接收模式: %v → %v", prev, on)
+		if s.onReceive != nil {
+			s.onReceive(on)
+		}
 	}
 }
+
+// IsReceiving 当前是否在接收模式.
+func (s *Server) IsReceiving() bool { return s.receiveMode.Load() }
 
 // CurrentFileName 返回当前发送的文件名 (并发安全).
 func (s *Server) CurrentFileName() string {
@@ -105,6 +137,12 @@ func (s *Server) CurrentFileName() string {
 // 必须在 Start 之前调用.
 func (s *Server) SetOnSwap(fn func(newName string)) {
 	s.onSwap = fn
+}
+
+// SetOnReceive 注册接收模式切换回调, 用于 main 起/关 receive webview.
+// 必须在 Start 之前调用.
+func (s *Server) SetOnReceive(fn func(on bool)) {
+	s.onReceive = fn
 }
 
 // SwapFile 把当前发送文件切换成 rawPath. 并发安全.
@@ -132,20 +170,31 @@ func (s *Server) Start() {
 	cleanupStaleTmp()
 
 	mux := http.NewServeMux()
+	// 发送侧路由 (无文件时 404)
 	mux.HandleFunc("/file", s.handleFile)
 	mux.HandleFunc("/qr", s.handleQR)
 	mux.HandleFunc("/d", s.handleDownload)
+	mux.HandleFunc("/", s.handleIndex)
+	// 接收侧路由 (始终注册, 但 /u 和 /upload 受 receiveMode 门禁)
+	mux.HandleFunc("/qr-recv", s.handleQRRecv)
+	mux.HandleFunc("/r", s.handleReceiveDashboard)
+	mux.HandleFunc("/u", s.handleUploadForm)
 	mux.HandleFunc("/upload", s.handleUpload)
+	// IPC (仅 127.0.0.1)
 	mux.HandleFunc("/internal/health", requireLocal(s.handleInternalHealth))
 	mux.HandleFunc("/internal/send", requireLocal(s.handleInternalSend))
-	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/internal/receive", requireLocal(s.handleInternalReceive))
 
 	s.httpSrv = &http.Server{Addr: ":8443", Handler: mux}
 
-	log.Printf("发送文件: %s (%s)", s.absPath, s.fileSize)
-	log.Printf("电脑端:   %s", s.homeURL)
-	log.Printf("手机端:   %s", s.mobileURL)
-	log.Printf("直链:     %s/file", s.baseURL)
+	if s.absPath != "" {
+		log.Printf("发送文件: %s (%s)", s.absPath, s.fileSize)
+		log.Printf("电脑端:   %s", s.homeURL)
+		log.Printf("手机端:   %s", s.mobileURL)
+		log.Printf("直链:     %s/file", s.baseURL)
+	} else {
+		log.Print("未指定文件, 仅启 daemon (可通过托盘/CLI 进入接收模式或后续 send)")
+	}
 	log.Printf("监听:     0.0.0.0:8443")
 
 	go func() {
@@ -172,13 +221,22 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	absPath, name := s.absPath, s.fileName
 	s.mu.RUnlock()
+	if absPath == "" {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Disposition", contentDisposition(name))
 	http.ServeFile(w, r, absPath)
 }
 
 // handleQR 把 mobileURL 渲染成 PNG, 给 / dashboard 内嵌 <img src="/qr"> 用.
 // QR 编码 /d (手机扫码进手机端发送页), 不是电脑端 dashboard.
+// 无文件时 404 (纯接收模式下没什么可扫的发送 QR).
 func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
+	if !s.HasFile() {
+		http.NotFound(w, r)
+		return
+	}
 	png, err := qr.Render(s.mobileURL)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -189,8 +247,22 @@ func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
 	w.Write(png)
 }
 
-// handleIndex / : 电脑端 webview 弹窗加载. 极简 dashboard.
-// 只渲 QR + 当前文件名 + 大小 + 关闭按钮 (ADR-17). 没有下载/上传/选文件.
+// handleQRRecv: /qr-recv PNG QR 编码接收 URL (/u). 接收 dashboard 用.
+// 不受 receiveMode 门禁 (用户从托盘点 "接收文件" 时窗口要立刻显示 QR).
+func (s *Server) handleQRRecv(w http.ResponseWriter, r *http.Request) {
+	png, err := qr.Render(s.uploadURL)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write(png)
+}
+
+// handleIndex / : 电脑端发送模式 webview 弹窗加载.
+// 极简 dashboard: 只渲 QR + 当前文件名 + 大小 + 关闭按钮 (ADR-17).
+// 无文件时 404 (纯接收模式 daemon 没东西可展示).
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -199,6 +271,10 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	name, size := s.fileName, s.fileSize
 	s.mu.RUnlock()
+	if name == "" {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	fmt.Fprintf(w, dashboardHTMLTpl, html.EscapeString(name), html.EscapeString(size))
@@ -206,13 +282,39 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 // handleDownload /d : 手机端发送目标页 (扫码进的就是这里).
 // 文件图标 + 文件名 + 大小 + 下载按钮, 没有 QR (手机不需要给自己看).
+// 无文件时 404.
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	name, size := s.fileName, s.fileSize
 	s.mu.RUnlock()
+	if name == "" {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	fmt.Fprintf(w, downloadHTMLTpl, html.EscapeString(name), html.EscapeString(size))
+}
+
+// handleReceiveDashboard /r : 电脑端接收模式 webview 弹窗加载.
+// 只渲 接收 QR + 提示 + 停止接收键 (ADR-17). 始终可达, 不受 receiveMode 门禁,
+// 因为 main 在 EnableReceive(true) 之后才会让 webview 加载这个 URL.
+func (s *Server) handleReceiveDashboard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write([]byte(receiveDashboardHTMLTpl))
+}
+
+// handleUploadForm /u : 手机端上传表单 (扫 /qr-recv 进的就是这里).
+// 受 receiveMode 门禁: 关时 404, 不暴露 "daemon 在跑但接收关了" 这条信息.
+func (s *Server) handleUploadForm(w http.ResponseWriter, r *http.Request) {
+	if !s.receiveMode.Load() {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write([]byte(uploadHTMLTpl))
 }
 
 // handleInternalHealth: GET /internal/health
@@ -248,6 +350,33 @@ func (s *Server) handleInternalSend(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("switched"))
+}
+
+// handleInternalReceive: POST /internal/receive body=on|off
+// 开/关接收模式. 用于 `quickdrop recv` 客户端模式让 daemon 切到接收状态.
+// 仅 127.0.0.1 可访问.
+func (s *Server) handleInternalReceive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "需要 POST", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 32))
+	if err != nil {
+		http.Error(w, "读 body 失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	cmd := strings.TrimSpace(string(body))
+	switch cmd {
+	case "on":
+		s.EnableReceive(true)
+	case "off":
+		s.EnableReceive(false)
+	default:
+		http.Error(w, `body 必须是 "on" 或 "off"`, http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(cmd))
 }
 
 // requireLocal 拒绝非 127.0.0.1 的访问, 直接 404 (不暴露存在性).

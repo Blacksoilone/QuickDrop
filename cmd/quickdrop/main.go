@@ -1,14 +1,17 @@
-// QuickDrop 入口: 三种模式
+// QuickDrop 入口: 多种模式
 //
 //  1. window 子命令: 子进程, 只跑 webview 加载指定 URL (供 daemon fork)
-//  2. Daemon 模式:   端口 8443 空闲 → 起 HTTP server + 托盘, 常驻
-//  3. Client 模式:   端口已被 QuickDrop daemon 占用 → POST /internal/send 通知
-//                    daemon 切换发送文件, 自己立刻退出
+//  2. send <path> 模式:
+//     - 端口 8443 空闲 → 起 daemon (HTTP server + 托盘) + 弹发送窗
+//     - 已被 QuickDrop daemon 占用 → POST /internal/send 通知切换, 客户端退出
+//  3. recv 模式:
+//     - 端口 8443 空闲 → 起 daemon (无文件) + 弹接收窗
+//     - 已被 QuickDrop daemon 占用 → POST /internal/receive on, 客户端退出
 //
 // 解决重复 `quickdrop send X` 端口冲突的无感问题 (QuickDrop.md §6 2.2 + 2.3).
+// 接收模式独立入口 + 安全分离 (2.13, ADR-17).
 //
 // 不再像 Phase 1 早期那样自动开浏览器 (ADR-11: 浏览器破坏"无感").
-// 用户从托盘菜单 "复制扫码链接" 拿 URL, 或者直接给同 WiFi 的手机扫码.
 package main
 
 import (
@@ -30,7 +33,7 @@ import (
 const (
 	daemonURL = "http://127.0.0.1:8443"
 
-	// envWindowMode: 控制 daemon 弹 webview 窗口的策略.
+	// envWindowMode: 控制 daemon 弹发送 webview 窗口的策略.
 	//   replace    (默认): 切换文件时先杀旧窗再开新窗, 屏幕上始终 1 个窗
 	//   keep       : 切换文件时旧窗保留, 屏幕上可能并存多个窗
 	//   first-only : 只在 daemon 首次启动时弹窗, 切换文件不开新窗
@@ -38,36 +41,23 @@ const (
 )
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `QuickDrop - 局域网快速发送
+	fmt.Fprintf(os.Stderr, `QuickDrop - 局域网快速发送/接收
 
 用法:
-  %s send <文件路径>
-  %s <文件路径>             # 拖拽文件到 .exe 也走此分支
-  %s window <url>           # 内部: webview 子进程入口, 不要手动调
+  %s send <文件路径>      发送模式
+  %s <文件路径>           同上 (拖拽到 .exe 也走此分支)
+  %s recv                 接收模式 (从手机往电脑传)
+  %s window <url>         内部: webview 子进程入口, 不要手动调
 
 环境变量:
-  %s=replace|keep|first-only  控制窗口策略 (默认 replace)
+  %s=replace|keep|first-only  控制发送窗口策略 (默认 replace)
 
 例:
   quickdrop.exe send C:\Users\you\Pictures\test.jpg
+  quickdrop.exe recv
 
-如果 daemon 已经在跑, 会切换 daemon 当前发送的文件, 不重启进程.
-`, os.Args[0], os.Args[0], os.Args[0], envWindowMode)
-}
-
-// parseSendArgs 支持两种形态:
-//
-//	quickdrop send <path>   显式语法
-//	quickdrop <path>        拖拽到 .exe 时 Windows 直接把路径作为 args[0]
-func parseSendArgs() (string, error) {
-	args := flag.Args()
-	if len(args) >= 1 && args[0] == "send" {
-		args = args[1:]
-	}
-	if len(args) != 1 {
-		return "", fmt.Errorf("参数数量不对")
-	}
-	return args[0], nil
+如果 daemon 已经在跑, send 切换发送文件 / recv 开启接收, 不重启进程.
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], envWindowMode)
 }
 
 func main() {
@@ -78,7 +68,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usage: quickdrop window <url>")
 			os.Exit(1)
 		}
-		setupLogging() // 子进程也写同一个日志, 便于排查
+		setupLogging()
 		log.Printf("--- window 子进程 pid=%d, url=%s ---", os.Getpid(), os.Args[2])
 		window.Run(os.Args[2], "QuickDrop", 0, 0)
 		return
@@ -87,17 +77,40 @@ func main() {
 	flag.Usage = usage
 	flag.Parse()
 
-	// build 加 -ldflags=-H=windowsgui 后双击/拖拽不会弹黑窗, 但 stderr/stdout 也丢了.
-	// 统一写 %TEMP%\quickdrop.log.
 	setupLogging()
 
-	rawPath, err := parseSendArgs()
+	args := flag.Args()
+
+	// recv 子命令: 接收模式
+	if len(args) >= 1 && args[0] == "recv" {
+		runRecv()
+		return
+	}
+
+	// send <path> 或裸路径
+	rawPath, err := parseSendArgs(args)
 	if err != nil {
 		usage()
 		os.Exit(1)
 	}
+	runSend(rawPath)
+}
 
-	// 把路径转绝对, 这样客户端模式 POST 给 daemon 时不依赖 daemon 的 cwd.
+// parseSendArgs 支持两种形态:
+//
+//	quickdrop send <path>   显式语法
+//	quickdrop <path>        拖拽到 .exe 时 Windows 直接把路径作为 args[0]
+func parseSendArgs(args []string) (string, error) {
+	if len(args) >= 1 && args[0] == "send" {
+		args = args[1:]
+	}
+	if len(args) != 1 {
+		return "", fmt.Errorf("参数数量不对")
+	}
+	return args[0], nil
+}
+
+func runSend(rawPath string) {
 	absPath, err := filepath.Abs(rawPath)
 	if err != nil {
 		log.Fatalf("路径解析失败: %v", err)
@@ -105,20 +118,30 @@ func main() {
 
 	if probeDaemon() {
 		log.Printf("发现已运行的 daemon, 走客户端模式切换文件: %s", absPath)
-		if err := notifyDaemon(absPath); err != nil {
+		if err := notifyDaemonSend(absPath); err != nil {
 			log.Fatalf("通知 daemon 失败: %v", err)
 		}
 		log.Print("daemon 已切换, 客户端退出")
 		return
 	}
+	log.Print("未发现 daemon, 启动新的 daemon (发送模式)")
+	runDaemon(absPath, false)
+}
 
-	log.Print("未发现 daemon, 启动新的 daemon")
-	runDaemon(absPath)
+func runRecv() {
+	if probeDaemon() {
+		log.Print("发现已运行的 daemon, 走客户端模式开启接收")
+		if err := notifyDaemonReceive("on"); err != nil {
+			log.Fatalf("通知 daemon 失败: %v", err)
+		}
+		log.Print("daemon 已切到接收, 客户端退出")
+		return
+	}
+	log.Print("未发现 daemon, 启动新的 daemon (接收模式)")
+	runDaemon("", true)
 }
 
 // probeDaemon GET /internal/health, 判断本机 8443 是不是 QuickDrop daemon.
-// true: 是 daemon, 走客户端模式
-// false: 端口空闲, 或被其他东西占用, 走 daemon 模式 (后者会在 ListenAndServe 时报错)
 func probeDaemon() bool {
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 	resp, err := client.Get(daemonURL + "/internal/health")
@@ -129,33 +152,42 @@ func probeDaemon() bool {
 	if resp.StatusCode != 200 {
 		return false
 	}
-	// X-QuickDrop: 1 防止某个无关 server 偶然占了 8443 又返回 200
 	return resp.Header.Get("X-QuickDrop") == "1"
 }
 
-// notifyDaemon POST /internal/send body=<绝对路径>, 让 daemon 切换发送文件.
-func notifyDaemon(absPath string) error {
+// notifyDaemonSend POST /internal/send body=<绝对路径>.
+func notifyDaemonSend(absPath string) error {
+	return postInternal("/internal/send", absPath)
+}
+
+// notifyDaemonReceive POST /internal/receive body=on|off.
+func notifyDaemonReceive(cmd string) error {
+	return postInternal("/internal/receive", cmd)
+}
+
+func postInternal(path, body string) error {
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Post(daemonURL+"/internal/send", "text/plain", strings.NewReader(absPath))
+	resp, err := client.Post(daemonURL+path, "text/plain", strings.NewReader(body))
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("daemon 返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("daemon 返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(rb)))
 	}
 	return nil
 }
 
 // runDaemon: 起 HTTP server + 托盘 + webview 子进程管理, 阻塞直到用户点 "退出".
-func runDaemon(absPath string) {
-	srv, err := server.New(absPath)
+// initialPath 为空表示纯接收模式启动 (此时 initialReceive 必须 true, 否则 daemon 啥也不干).
+// initialReceive 表示 daemon 启动后立刻开启接收模式 + 弹接收窗.
+func runDaemon(initialPath string, initialReceive bool) {
+	srv, err := server.New(initialPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// webview 子进程管理器
 	selfExe, err := os.Executable()
 	if err != nil {
 		log.Fatalf("拿不到自身可执行路径: %v", err)
@@ -164,20 +196,38 @@ func runDaemon(absPath string) {
 	winMgr := window.NewManager(mode, selfExe)
 	log.Printf("窗口策略: %s (env %s=%s)", mode, envWindowMode, os.Getenv(envWindowMode))
 
-	// 文件切换时: 刷托盘 tooltip + 弹窗 (按 mode 策略)
+	// 文件切换时: 刷托盘 tooltip + 弹发送窗 (按 mode 策略)
 	srv.SetOnSwap(func(name string) {
 		tray.UpdateTooltip(name)
 		winMgr.OpenForFile(srv.HomeURL())
 	})
+
+	// 接收模式切换时: 起/关接收窗 + 同步托盘菜单勾选
+	srv.SetOnReceive(func(on bool) {
+		tray.SetReceiveChecked(on)
+		if on {
+			winMgr.OpenReceiveWindow(srv.ReceiveURL())
+		} else {
+			winMgr.CloseReceiveWindow()
+		}
+	})
+
 	srv.Start()
 
-	// daemon 首次启动也开一个窗 (显示初始文件的 QR)
-	winMgr.OpenForFile(srv.HomeURL())
+	// daemon 启动行为分支
+	if srv.HasFile() {
+		winMgr.OpenForFile(srv.HomeURL())
+	}
+	if initialReceive {
+		srv.EnableReceive(true) // 会触发 onReceive → 起接收窗 + 勾菜单
+	}
 
-	// systray.Run 阻塞 + 必须在 main goroutine.
-	// 用户点 "退出" → onExit 关 HTTP server + 杀所有 webview 子进程 → systray.Run 返回 → 进程退出.
-	// shareURL 用 mobileURL (指向 /d 手机端发送页), 给朋友复制走的就该是这个.
-	tray.Run(srv.MobileURL(), srv.CurrentFileName(), func() {
+	// 托盘 "接收文件" 菜单点击 → 切 server.EnableReceive (会再触发 onReceive 回调)
+	onTrayReceive := func(on bool) {
+		srv.EnableReceive(on)
+	}
+
+	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, func() {
 		winMgr.Shutdown()
 		srv.Shutdown()
 	})

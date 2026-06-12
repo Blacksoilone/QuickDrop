@@ -22,19 +22,22 @@
 ## 2. 项目结构
 
 ```
-cmd/quickdrop/main.go         入口,window 子命令 + probeDaemon → client/daemon
-internal/server/server.go     HTTP server (Start/Shutdown/SwapFile), /internal/{health,send}
-internal/server/templates.go  HTML 模板
+cmd/quickdrop/main.go         入口,window/recv/send 三子命令 + probeDaemon → client/daemon
+internal/server/server.go     HTTP server (Start/Shutdown/SwapFile/EnableReceive),
+                              路由含 /、/d、/r、/u、/file、/qr、/qr-recv、/upload、/internal/*
+internal/server/templates.go  HTML 模板 (4 套: 发送 dashboard / 下载 / 接收 dashboard / 上传)
 internal/qr/qr.go             QR PNG 渲染
-internal/tray/tray.go         systray, 菜单(复制链接/退出), UpdateTooltip
+internal/tray/tray.go         systray, 菜单(复制链接/接收文件 checkbox/退出), UpdateTooltip + SetReceiveChecked
 internal/tray/icon.ico        托盘图标 16x16 (Windows systray 必须 ICO,不能 PNG)
-internal/window/window.go     webview 子进程实际渲染函数 (runWebview)
-internal/window/manager.go    daemon 持有的子进程管理器 + Mode (replace/keep/first-only)
+internal/window/window.go     webview 子进程实际渲染函数 (runWebview, 含 quickdropClose binding)
+internal/window/manager.go    daemon 持有的子进程管理器 + Mode + recvCmd (发送窗+接收窗独立)
 build.ps1                     一键构建脚本
 test/prepare-fixtures.ps1     生成 500MB big.bin + 你好世界.png 验收固件
 test/test-crash-cleanup.ps1   验收用例 5 自动化 (中途崩溃 → 重启清理)
 test/test-daemon-switch.ps1   Phase 2.2+2.3 验收: daemon 健康检查 / 客户端 IPC 切换
 test/test-window.ps1          Phase 2.10 验收: webview 子进程 + 三种 window-mode
+test/test-routes.ps1          Phase 2.11 + 2.10 UI 验收: ADR-17 路由语义
+test/test-receive.ps1         Phase 2.13 验收: 接收模式独立入口 + /u 状态切换 + 上传落盘
 TEST.md                       Phase 1 验收清单 (手动 + 自动)
 ```
 
@@ -64,6 +67,15 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
   - 托盘"复制扫码链接"复制 `mobileURL` (给朋友的链接)
   - 路由语义自动验证:`/`无上传无下载、`/d`无 QR 有下载、`/upload POST`默认 404、`/qr`仍 200 PNG
   - 像素采样验证窗口外观:QR 完整(851 黑像素)、无右侧滚动条(右边纯白)、尺寸贴合(279×353 含标题栏)
+- [x] **任务 2.13 接收模式 + 安全分离** (ADR-17):
+  - `quickdrop recv` 新 CLI 子命令 / 托盘 "接收文件" checkbox 菜单项 (二者通过 IPC `/internal/receive on|off` 统一切换)
+  - `server.EnableReceive(bool)` + `SetOnReceive` 回调: tray 菜单同步勾选 + winMgr 起/关接收窗
+  - 新路由: `/r` 接收 dashboard (QR + 提示 + 停止接收键) + `/qr-recv` 编码上传 URL + `/u` 上传表单 (受 receiveMode 门禁)
+  - daemon 支持纯接收模式启动 (无文件): 发送类路由全 404 防泄露
+  - 发送和接收可共存: send 模式 daemon 也可 IPC `recv on` 同时开两种模式
+  - "停止接收"按钮: HTML `fetch /internal/receive off → quickdropClose()` 一键关接收+关窗
+  - 接收窗 webview 子进程独立于发送窗 (Manager.recvCmd 单实例字段, 不受 window-mode 影响)
+  - test-receive.ps1 17 checks ALL PASS (含 LAN 拦截 + 真实上传落盘验证)
 
 ## 4. 遇到的问题
 
@@ -80,40 +92,22 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 
 ## 5. 待办
 
-### 下一步 — 2.11 路由分化 + 2.10 UI 收尾 (按 ADR-17)
+### 下一步候选
 
-实际用了一下 v0.3.0 发现 UI 不行: 上下太长, 没固定宽度需要滑动才看到完整 QR, 电脑端弹窗里居然有上传区块。**已写入 ADR-17 修订**:
+按 [QuickDrop.md §6 Phase 2](./QuickDrop.md):
 
-1. **电脑端弹窗** (2.10 UI 收尾):
-   - 无边框、固定 ~280px 宽
-   - 只显示: **QR + 文件名 + 大小 + 关闭按钮**
-   - 没有"下载到此设备"区块 (电脑端不需要下载给自己)
-   - 没有"上传到电脑"区块 (上传留给 2.13 接收模式)
-2. **路由分化** (2.11):
-   - `/` → 电脑端 dashboard, 极简版 (上一条)
-   - `/d` → 手机端发送目标页, **用文件图标/缩略图替代 QR**, 仅显示文件信息 + 下载按钮
-   - `/u` → 手机端上传页, **默认 404, 仅接收模式开启时存在** (见 2.13)
-3. **2.13 接收模式 + 安全分离** (ADR-17 新增):
-   - 默认 `/u` 不存在,任何陌生人扫到发送 QR 都不能向 `~/Downloads/QuickDrop/` 塞文件 (解决当前隐患)
-   - 入口: `quickdrop recv` / 托盘"接收文件"菜单 / 配置页按钮
-   - 接收模式弹独立窗 → 显示接收 QR → 完成或停止后 `/u` 立即注销
-4. **2.12 托盘菜单扩充**: 加 "接收文件" / "打开配置", 复杂功能从弹窗剥离
-
-详见 [QuickDrop.md §6 + ADR-17](./QuickDrop.md)。
+- **2.4 Windows 右键菜单**: 注册表写入,装上之后用户右键文件 → "通过 QuickDrop 发送",才真正"无感"
+- **2.7 Vue 工程化**: 路由已稳 (`/`、`/d`、`/r`、`/u`),可上 Vue 重写模板
+- **2.5 + 2.6** mDNS 发现 PC + 设备记忆
+- **2.8 + 2.9** WebSocket 进度 + Windows toast
 
 ### 待补验收
 
 - ⏸ TEST.md 用例 6 多手机并发(等借到第二台手机)
-
-### 后续 Phase 2 顺位
-
-- 2.7 Vue 工程化(2.11 路由设计敲定后再上 Vue)
-- 2.4 Windows 右键菜单(注册表写入,有了之后才真正"无感")
-- 2.5 mDNS 发现 PC / 2.6 设备记忆
-- 2.8 WebSocket 进度 / 2.9 Windows toast
 
 ### 后续 Phase 2 才做的小项
 
 - 托盘图标用绘图软件画一个像样的(目前是纯蓝 16x16 占位)
 - daemon 模式发现端口被占但响应不是 QuickDrop 时,给用户更友好的报错
 - `QUICKDROP_WINDOW_MODE` 配置项最终应进配置页 UI (现在只能 env 设置)
+- 接收完成后自动关闭接收模式 (现在要用户手动点"停止接收"或托盘取消勾,有可能忘了一直开着)
