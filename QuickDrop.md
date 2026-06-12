@@ -49,7 +49,8 @@ Windows 上没有的 AirDrop —— 右键文件即发送,扫码即接收,局域
 | 二维码 | `github.com/skip2/go-qrcode` | PNG/SVG 输出 |
 | 系统托盘 | `github.com/getlantern/systray` | Wails v2 没原生托盘,v3 alpha 风险高 |
 | 自有窗口 | `github.com/webview/webview_go` + Windows WebView2 | 复用 `/qr` 路由,不打包浏览器 |
-| mDNS 服务发现 | `github.com/betamos/zeroconf` | Phase 2 才用 |
+| mDNS 服务发现 | `github.com/grandcat/zeroconf` | Phase 2.5a, 比 betamos 维护更活跃 |
+| Windows toast 通知 | `github.com/go-toast/toast` | Phase 2.5c, 原生 actions 支持 (接受/拒绝按钮) |
 | 前端框架 | Vue 3 + Vite | Phase 2 才用,Phase 1 写死 HTML |
 | 前端打包 | Go 1.16+ `embed.FS` | 单二进制分发关键 |
 
@@ -79,8 +80,28 @@ Windows 上没有的 AirDrop —— 右键文件即发送,扫码即接收,局域
 - **2.2** Daemon 模式:第一次启动常驻;后续 `quickdrop send X` 检测 daemon 已跑就走 IPC,不重启进程
 - **2.3** IPC:HTTP 到 `127.0.0.1:8443/internal/send`,先不上 Named Pipe
 - **2.4** Windows 右键菜单(已实现 v0.6.0):`quickdrop install` 写注册表 `HKCU\Software\Classes\*\shell\QuickDrop\command`,值 `"C:\path\quickdrop.exe" send "%1"`。`uninstall` 删,`status` 看。用户级 (HKCU) 无需 UAC。**Win11 限制**:传统注册表方式在 Win11 下显示在 "显示更多选项" 里 (Shift+右键直达),顶级菜单需要 MSIX sparse package + IExplorerCommand (留 Phase 4,见 ADR-18)
-- **2.5** mDNS 广播 + 发现 PC 列表
-- **2.6** 设备记忆:JSON `~/.quickdrop/devices.json`
+- **2.5** mDNS 发现 + PC→PC 互传 (ADR-19, ADR-20): 拆 5 个子步骤
+  - **2.5a** mDNS 广播 + 发现: `github.com/grandcat/zeroconf`, 服务名 `_quickdrop._tcp.local`,
+    广播主机名 + 用户起的显示名 + LAN IP + 端口。daemon 起 server 时一并起 mDNS,
+    托盘菜单 / 配置页 / 弹窗里能看到"局域网内的 QuickDrop 实例" 列表
+  - **2.5b** 设备间 IPC 协议: 新路由 `/peer/incoming` POST (来自其他 PC), body =
+    `{ from: "老王的电脑", id: "uuid", fileName: "x.png", fileSize: 1234567 }`,
+    daemon 暂存到内存 pending queue, 等用户接受/拒绝。发送方对应新路由 `/peer/file?id=xxx`
+    暴露文件 (有 token, 不复用 `/file` 防误用)
+  - **2.5c** Toast 通知: 引 `github.com/go-toast/toast`, 收到 `/peer/incoming` 后
+    弹 toast "老王的电脑 想发 x.png (1.2MB) [接受] [拒绝]", actions 走 `quickdrop://`
+    URL scheme; install 时注册 `HKCU\Software\Classes\quickdrop\shell\open\command`
+  - **2.5d** quickdrop:// URL handler: `quickdrop accept --id xxx` / `quickdrop reject --id xxx`
+    新 CLI 子命令, 通过 IPC POST 给 daemon `/internal/peer-decide`,
+    accept 时 daemon 主动 GET `http://发送方:8443/peer/file?id=xxx` Pull 文件到 `~/Downloads/QuickDrop/`,
+    reject 时回 `/peer/decision?id=xxx&decision=reject` 让发送方知道
+  - **2.5e** 红点 fallback: 托盘 tooltip 改 "QuickDrop - 1 个待处理", 菜单加
+    "待处理文件 (1)" 项, 点击打开独立 webview 列表页 (`/pending`), 用户可批量接受/拒绝
+- **2.6** 设备记忆 + 信任升级 (配合 ADR-20):
+  - JSON 文件 `~/.quickdrop/devices.json` 记录已交互过的 PC 及"是否信任"
+  - 配置页 / `/pending` 页加 "信任此设备" 复选框, 勾上后该设备发文件:
+    toast 仍弹但 3 秒后自动接受 (中途用户可点"拒绝"撤销)
+  - 加 "永不信任此设备" 黑名单, 黑名单内设备发文件: toast 不弹, daemon 直接回 reject
 - **2.7** Vue 3 工程化(已实现 v0.7.0):`web/` 目录 Vite + Vue3 + TS MPA (4 个独立入口对应 / /d /r /u 4 路由),Dashboard/Download/Receive/Upload.vue 替代 HTML 模板;构建产物 `web/dist/` 由 build.ps1 复制到 `cmd/quickdrop/web/` 用 `embed.FS` 打进 .exe;新增 `/api/info` JSON API 供 Vue 拉服务状态
 - **2.8** WebSocket 实时进度
 - **2.9** Windows toast 通知接收方
@@ -147,3 +168,5 @@ Windows 上没有的 AirDrop —— 右键文件即发送,扫码即接收,局域
 | 16 | **window-mode 三种策略 (replace/keep/first-only)** 由 env `QUICKDROP_WINDOW_MODE` 配置 | 一次 send 一个文件给一个人 → replace (默认, 屏幕始终 1 窗); 多文件多人 → keep (屏幕保留所有 QR 窗); 嫌烦 → first-only (只首次开窗)。Phase 2 后期配置页 UI 实装时把 env 移过去 |
 | 17 | **极简 UI 修订** (完全推翻 ADR-13, 加强 ADR-14, 引入安全约束) | 实际用了一下发现 Phase 1/2.10 UI 长且没固定宽度、电脑端弹窗里居然有"上传"区块、手机扫码进的下载页又显示 QR——全是冗余。新方案: (1) **电脑端弹窗只显示 QR + 文件名 + 大小 + 关闭键**, 无边框, 固定 ~280px 宽; (2) **手机端发送页用文件图标/缩略图替代 QR** (手机不需要看自己的 QR); (3) **手机端默认无上传功能** — 任何陌生人扫到 QR 都能往你电脑塞文件是真实安全风险, 上传仅在用户主动进"接收模式"后才可用; (4) **复杂功能 (选文件 / 接收文件 / 配置)** 从弹窗剥离, 走托盘菜单或独立配置页, 弹窗保持极简 |
 | 18 | **右键菜单走传统注册表 HKCU, Win11 顶级显示留 Phase 4** | 传统 `HKCU\Software\Classes\*\shell\X\command` 注册表方式: 简单 (~80 行 Go), 用户级无需 UAC, Win10 完美工作, Win11 显示在 "显示更多选项" / Shift+右键里。Win11 顶级菜单 (跟"复制""粘贴"同级) 需要 MSIX sparse package + IExplorerCommand COM, 工程量大且需打包安装器。先解决 90% 场景, MSIX 留 Phase 4 |
+| 19 | **PC→PC 接收提示: Toast 主交互 + 托盘红点 fallback** | Windows 10/11 toast 原生支持 actions (最多 5 个按钮, "接受/拒绝"够用), 比"看托盘图标" 感知强一个数量级。但 toast 会被用户/系统设置静音 → 必须有 fallback 防丢消息: 同时改托盘 tooltip + 菜单加 "待处理 (N)" 红点项。Toast 按钮通过 `quickdrop://accept?id=xxx` URL scheme 触发 (install 时多注册一个 protocol handler), 接收方 daemon 解析 URL → IPC 完成接收。文件流: Pull 模式 (接收方拉发送方的 `/file?id=xxx`), 复用现有 server, 不引新对称协议 |
+| 20 | **信任模型: 2.5 每次确认, 2.6 设备记忆后可信任** | 起步阶段 LAN 任何 QuickDrop 实例都能向你发 toast → 这是滥用面 (尤其公司/咖啡馆 WiFi)。2.5 阶段每次接收都要点 toast 按钮 (AirDrop 风格的强制确认), 即使是"自己的另一台电脑"。2.6 设备记忆做完后, toast 加 "信任此设备" 复选框, 勾上后该设备发文件免确认 (但 UI 仍有 toast, 只是默认 3 秒后自动接受)。永远保留 "永不信任此设备" 黑名单 |

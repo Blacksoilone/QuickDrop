@@ -130,12 +130,21 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
 
 ## 5. 待办
 
-### 下一步候选
+### 下一步 — 2.5 mDNS 发现 + PC→PC 互传 (ADR-19, ADR-20)
 
-按 [QuickDrop.md §6 Phase 2](./QuickDrop.md):
+按 [QuickDrop.md §6 Phase 2.5](./QuickDrop.md) 拆 5 个递进子步骤,每个独立可 commit:
 
-- **2.5 + 2.6** mDNS 发现 PC + 设备记忆: 发送时除手机扫码外,可点列表里的 PC 直接发
-- **2.8 + 2.9** WebSocket 进度 + Windows toast: 实时进度条 + 接收方桌面通知
+- **2.5a** mDNS 广播 + 发现: 起 `_quickdrop._tcp.local` 服务, 托盘菜单/Vue 页面看局域网内 PC 列表
+- **2.5b** PC→PC IPC: `/peer/incoming` 接收元数据 + pending queue + `/peer/file?id=xxx` 鉴权下载
+- **2.5c** Toast 通知 (ADR-19): `go-toast` 弹按钮 toast, install 注册 `quickdrop://` URL scheme
+- **2.5d** `quickdrop accept --id` / `reject --id` 子命令: URL 触发 → Pull 文件
+- **2.5e** 红点 fallback: 托盘菜单 "待处理 (N)" + `/pending` Vue 页面
+
+完成后下一步是 **2.6 设备记忆 + 信任升级**: `~/.quickdrop/devices.json` + "信任此设备" 复选框.
+
+### 后续 Phase 2 顺位
+
+- **2.8 + 2.9** WebSocket 进度 + Windows toast 完成提示: 实时进度条 + 文件传输完成的轻通知
 - **Phase 3 起步**: HTTPS via lancert.dev + PWA manifest, 真机适配开始
 
 ### 待补验收
@@ -143,6 +152,7 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
 - ⏸ TEST.md 用例 6 多手机并发(等借到第二台手机)
 - ⏸ Win11 实地复核右键菜单显示位置 (Shift+右键 / "显示更多选项")
 - ⏸ Vue 页面在真手机浏览器渲染 (UA 测试, 主要是 iOS Safari 兼容)
+- ⏸ PC→PC 互传需要第二台 Windows PC (现阶段缺设备)
 
 ### 后续 Phase 2 才做的小项
 
