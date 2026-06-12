@@ -14,40 +14,45 @@
 | Node / npm | 24.16 / 11.13 (Phase 2.7 才用) |
 | WebView2 Runtime | 149.0(Win11 自带,Phase 2.10 才用) |
 
-**编译**:`go build -o quickdrop.exe`
+**编译**:`go build -ldflags="-H=windowsgui" -o quickdrop.exe ./cmd/quickdrop`
 **运行**:`.\quickdrop.exe send <文件路径>`
 **测试文件**:[test.png](./test.png)(1.1 MB)
+**日志**:`%TEMP%\quickdrop.log`(`-H=windowsgui` 下 stderr 无效,统一写文件)
 
-## 2. 已完成
+## 2. 项目结构
+
+```
+cmd/quickdrop/main.go         入口,参数解析,日志,组装 server+tray
+internal/server/server.go     HTTP server (Start/Shutdown), 路由, LAN IP, 文件保存
+internal/server/templates.go  HTML 模板
+internal/qr/qr.go             QR PNG 渲染
+internal/tray/tray.go         systray, 菜单(复制链接/退出)
+internal/tray/icon.ico        托盘图标 16x16 (Windows systray 必须 ICO,不能 PNG)
+```
+
+## 3. 已完成
 
 - [x] 产品定位、技术栈、Phase 1-4 路线、ADR(详见 QuickDrop.md)
 - [x] **开发环境迁移**:WSL 交叉编译 → Windows 原生
 - [x] **任务 1.1** HTTP 骨架:`/` 路由返回 HTML,监听 `0.0.0.0:8443`
 - [x] **任务 1.2** `/file` 下载:`http.ServeFile` + `Content-Disposition: attachment` 强制下载
-- [x] **任务 1.3** 网页 QR(已修订,见 QuickDrop.md ADR-13):`/qr` 返回 PNG,主页内嵌 `<img>`,启动自动开浏览器
+- [x] **任务 1.3** 网页 QR(已修订,见 QuickDrop.md ADR-13):`/qr` 返回 PNG,主页内嵌 `<img>`
+- [x] **任务 1.4** 系统托盘:`getlantern/systray` + `atotto/clipboard`,菜单"复制扫码链接"/"退出",删掉 Phase 1 自动开浏览器代码(ADR-11)
 - [x] **任务 1.5** 命令行:`flag` 包,支持 `send <path>` 显式语法 + 拖拽单参数
 - [x] **任务 1.6** `/upload`:`MultipartReader` 流式 + 临时文件 + rename,中文文件名 RFC 5987 编码
+- [x] **任务 2.1** 拆包:`cmd/quickdrop` + `internal/{server,qr,tray}`(见 §2)
 
-## 3. 遇到的问题
+## 4. 遇到的问题
 
 - **Windows 防火墙**:第一次跑会弹窗,必须勾"专用网络"和"公用网络"全允许,否则手机连不上
 - **控制台中文乱码**:PowerShell 默认 GBK,Go 输出 UTF-8 时日志显示乱码。HTTP 响应里的中文是对的。临时方案 `chcp 65001`
 - **`proxy.golang.org` 在国内不通**:已固化 `goproxy.cn`(见 §1)
 - **CGO 工具链**:`getlantern/systray` 与 `webview/webview_go` 都依赖 CGO。已装 mingw-w64,`CGO_ENABLED=1` 默认开启
+- **systray.SetIcon 在 Windows 必须 ICO**:传 PNG 报 `Unable to set icon: The operation completed successfully.`,SetTitle 兜底文字仍可见但无图标。解决:用 PNG-in-ICO 容器(Vista+ 支持)。`internal/tray/icon.ico` 是临时占位
+- **`-H=windowsgui` 下 stderr 失效**:`io.MultiWriter(os.Stderr, f)` 在 stderr 无效时 short-circuit,文件那段永远写不到。解决:`log.SetOutput(f)` 只写文件,调试时 tail `%TEMP%\quickdrop.log`
+- **`Stop-Process -Force` 不会触发 Shutdown**:测试时强杀进程跳过 systray onExit → server.Shutdown 也跳过。真实退出路径是用户点托盘"退出"菜单,需要 GUI session 才能验证
 
-## 4. 待办
-
-### 任务 1.4 — 系统托盘
-
-- 引入 `github.com/getlantern/systray`,启动调 `systray.Run(onReady, onExit)`
-- `onReady`:`embed.FS` 嵌 16x16 PNG 图标 + 菜单项"复制扫码链接"、"退出"
-- 点"退出"先 HTTP server `Shutdown` 再 `systray.Quit()`
-
-**关键陷阱**:
-- `systray.Run` 阻塞调用线程且必须在 main goroutine,HTTP server 要放 `go func() {...}()` 里
-- 退出时 HTTP server 必须先 `Shutdown`,不然进程不会退干净
-
-**验收**:右下角任务栏有图标 → 点退出 → 任务管理器看不到 `quickdrop.exe`
+## 5. 待办
 
 ### 任务 1.7 — Phase 1 验收
 
@@ -58,7 +63,11 @@
 2. 大文件(>500MB)发送
 3. 中文文件名发送
 4. 中文文件名上传
-5. 传输中点托盘退出 → 程序应干净退出且不留临时文件
+5. 传输中点托盘"退出" → 程序应干净退出且不留临时文件(`%TEMP%` 里检查 `*.tmp`)
 6. 同时多个手机访问(行为 OK 即可,并发问题留 Phase 2)
 
 **Phase 1 完成标志**:上面 6 条都过了,能放心把 .exe 给一个朋友说"扫码就能给我发文件"。
+
+### 后续(Phase 2 才做)
+
+托盘图标用绘图软件画一个像样的(目前是纯蓝 16x16 占位),Phase 2.10 WebView2 小窗实装时一并替换。
