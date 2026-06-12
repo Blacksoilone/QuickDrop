@@ -79,9 +79,10 @@ if ($pA.HasExited -or $pB.HasExited) {
 }
 
 # 清空 Bob 的 Downloads/QuickDrop, 准备接收
+# 注意: 仅删测试目标 test.png (其他用户文件不动)
 $dlDir = Join-Path $env:USERPROFILE "Downloads\QuickDrop"
-if (Test-Path $dlDir) {
-    Get-ChildItem $dlDir -Filter "test.png" -ErrorAction SilentlyContinue | Remove-Item -Force
+if (Test-Path -LiteralPath (Join-Path $dlDir "test.png")) {
+    Remove-Item -LiteralPath (Join-Path $dlDir "test.png") -Force
 }
 
 Write-Host ""
@@ -192,10 +193,11 @@ Start-Sleep -Seconds 3
 $dst3 = Join-Path $dlDir "test.png"
 Check "url-action accept 后文件落盘" (Test-Path -LiteralPath $dst3)
 
-# 清理
+# 清理: 只删测试目录里"看起来像我们造的"文件, 不要删任何用户可能保留的.
+# 我们 test.png 是仓库根的固定测试文件, 名字 "test.png" 撞用户实际接收过的同名文件,
+# 所以这里只清 daemon 进程, 不删 Downloads. 用户后续要清自己删.
 Stop-Process -Id $pA.Id -Force -ErrorAction SilentlyContinue
 Stop-Process -Id $pB.Id -Force -ErrorAction SilentlyContinue
-Get-ChildItem $dlDir -Filter "test.png" -ErrorAction SilentlyContinue | Remove-Item -Force
 
 if ($backupId) {
     [System.IO.File]::WriteAllText($idFile, $backupId)
