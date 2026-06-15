@@ -39,6 +39,7 @@ import (
 
 	"quickdrop/internal/config"
 	"quickdrop/internal/devices"
+	"quickdrop/internal/dialog"
 	"quickdrop/internal/discovery"
 	"quickdrop/internal/identity"
 	"quickdrop/internal/installer"
@@ -581,6 +582,27 @@ func runDaemon(initialPath string, initialReceive bool) {
 		winMgr.OpenConfigWindow(configURL)
 	}
 
+	// 托盘 "选文件发送..." 菜单点击 → 弹原生选择器 → 选中后 SwapFile + 弹 QR 窗.
+	// 跟 `quickdrop send <path>` / 右键 / 拖拽路径完全等价, 只是入口换成系统对话框.
+	// 用户取消选择 = noop. 选了无效文件 = log 错误吞掉 (托盘没好途径反馈).
+	onTrayPickFile := func() {
+		path, err := dialog.PickFile()
+		if err != nil {
+			log.Printf("打开文件选择器失败: %v", err)
+			return
+		}
+		if path == "" {
+			return // 用户取消
+		}
+		if err := srv.SwapFile(path); err != nil {
+			log.Printf("SwapFile %s 失败: %v", path, err)
+			return
+		}
+		// 跟 send 路径一致: 弹发送窗 (replace/keep/first-only 行为由 winMgr 持有)
+		winMgr.OpenForFile(srv.HomeURL())
+		log.Printf("从托盘选了文件发送: %s", path)
+	}
+
 	// 监听 HTTP server 异常退出 (listener 被外部杀 / 网络栈炸 / 端口被夺):
 	// 触发 systray.Quit() → tray.Run 解阻塞 → onExit 跑标准清理路径.
 	// 比 log.Fatal 强: defer 会被执行, mDNS 下播 + 子窗清理 + 设备表 flush 都不会丢.
@@ -594,7 +616,7 @@ func runDaemon(initialPath string, initialReceive bool) {
 		tray.Quit()
 	}()
 
-	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, onTrayPending, onTrayDevices, onTrayConfig, func() {
+	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, onTrayPending, onTrayDevices, onTrayConfig, onTrayPickFile, func() {
 		if disc != nil {
 			disc.Close()
 		}

@@ -46,9 +46,10 @@ var (
 // onDevices:   用户点 "设备管理" 时调 (main 起 devices webview 子窗加载 /v).
 //              v0.11.0+ 已合并到 /c#devices, 这个回调暂时保留: 让 main 决定是不是用 onConfig 替代.
 // onConfig:    用户点 "设置" 时调 (main 起 config webview 子窗加载 /c).
+// onPickFile:  用户点 "选文件发送..." 时调 (main 弹原生选择器 + SwapFile).
 // onExit:      用户点退出时调用 (典型用法: server.Shutdown()).
 //              onExit 在 systray.Quit() 之后, 进程返回前执行.
-func Run(shareURL, initialName string, onReceive func(on bool), onPending func(), onDevices func(), onConfig func(), onExit func()) {
+func Run(shareURL, initialName string, onReceive func(on bool), onPending func(), onDevices func(), onConfig func(), onPickFile func(), onExit func()) {
 	onReady := func() {
 		systray.SetIcon(iconNormalBytes)
 		systray.SetTitle("QuickDrop")
@@ -58,6 +59,7 @@ func Run(shareURL, initialName string, onReceive func(on bool), onPending func()
 		systray.SetTooltip(buildTooltip())
 
 		mCopy := systray.AddMenuItem("复制扫码链接", "把 "+shareURL+" 写到剪贴板")
+		mPick := systray.AddMenuItem("选文件发送...", "弹原生选择器选一个文件直接发送 (替代右键/拖拽)")
 		mRecv := systray.AddMenuItemCheckbox("接收文件", "开启接收模式, 弹接收 QR 窗", false)
 		mPend := systray.AddMenuItem("待处理 (0)", "查看待接受/拒绝的文件传入")
 		mPend.Hide() // 默认隐藏, 有 pending 时显示
@@ -80,6 +82,12 @@ func Run(shareURL, initialName string, onReceive func(on bool), onPending func()
 						log.Printf("复制到剪贴板失败: %v", err)
 					} else {
 						log.Printf("已复制: %s", shareURL)
+					}
+				case <-mPick.ClickedCh:
+					if onPickFile != nil {
+						// onPickFile 内部弹 GetOpenFileNameW (阻塞), 在 systray goroutine
+						// 跑没问题 - systray 的菜单消息循环在 onReady 已起好.
+						go onPickFile() // 用 goroutine 防对话框阻塞菜单消息派发
 					}
 				case <-mRecv.ClickedCh:
 					if mRecv.Checked() {
