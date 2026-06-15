@@ -116,6 +116,13 @@ func Run(shareURL, initialName string, onReceive func(on bool), onPending func()
 	systray.Run(onReady, onExit)
 }
 
+// Quit 让外部触发托盘退出 (从而 tray.Run 解阻塞 + onExit 被执行).
+// 用于 daemon 异常场景: HTTP server 自己挂了, 需要拉 daemon 一起跑标准 cleanup.
+// 多次调用安全 (systray 内部幂等).
+func Quit() {
+	systray.Quit()
+}
+
 // SetReceiveChecked 让外部 (server.EnableReceive 回调) 同步菜单勾选状态.
 // 用于 "停止接收" 按钮 / IPC 关接收模式时, 菜单也跟着取消勾.
 //

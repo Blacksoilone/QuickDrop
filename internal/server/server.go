@@ -66,6 +66,8 @@ type Server struct {
 	uploadURL  string // 手机端上传 URL (接收模式 QR 编码)
 	baseURL    string // http://<lan>:<port>
 	httpSrv    *http.Server
+	httpDone   chan struct{} // listener goroutine 退出时 close, 供 main 做优雅清理
+	httpErr    error         // listener 退出时的错误 (非 ErrServerClosed); 仅 main 在 httpDone 之后读, 无并发
 
 	// dist 是 Vite 构建产物的 fs (含 index.html / d.html / r.html / u.html / assets/*).
 	// 由 cmd/quickdrop 通过 SetDist 注入 (因为 //go:embed 必须在 main 包里相对仓库根).
@@ -477,6 +479,7 @@ func (s *Server) Start() {
 	mux.Handle("/assets/", http.FileServer(http.FS(s.dist)))
 
 	s.httpSrv = &http.Server{Addr: fmt.Sprintf(":%d", s.port), Handler: mux}
+	s.httpDone = make(chan struct{})
 
 	if s.absPath != "" {
 		log.Printf("发送文件: %s (%s)", s.absPath, s.fileSize)
@@ -489,9 +492,15 @@ func (s *Server) Start() {
 	log.Printf("监听:     0.0.0.0:%d", s.port)
 
 	go func() {
-		if err := s.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server 退出: %v", err)
+		err := s.httpSrv.ListenAndServe()
+		if err != nil && err != http.ErrServerClosed {
+			// 不要 log.Fatal: 这会 os.Exit(1) 跳过 main 里 disc.Close / winMgr.Shutdown,
+			// 留下孤儿 webview / mDNS 不下播 / pending 写盘半截. 改记错并 close httpDone,
+			// main 监听到 Done() 后跑标准退出路径 (跟用户点托盘"退出"等价).
+			log.Printf("HTTP server 异常退出: %v", err)
+			s.httpErr = err
 		}
+		close(s.httpDone)
 	}()
 }
 
@@ -506,6 +515,25 @@ func (s *Server) Shutdown() {
 	if err := s.httpSrv.Shutdown(ctx); err != nil {
 		log.Printf("HTTP server 关闭失败: %v", err)
 	}
+}
+
+// Done 返回一个在 listener goroutine 退出后被 close 的 channel.
+// main 用 select 监听: 既等 tray.Quit 也等 server 异常退出, 任一触发都跑标准 cleanup.
+//
+// 触发场景:
+//   - 正常: Shutdown() → ListenAndServe 返 ErrServerClosed → close
+//   - 异常: listener accept 错 / 网络栈炸 / 端口被外部夺走 → 记 httpErr → close
+//
+// 多次调用安全 (channel 只 close 一次).
+// Server 没 Start 之前调返 nil-channel (永远 block, 等价语义正确).
+func (s *Server) Done() <-chan struct{} {
+	return s.httpDone
+}
+
+// Err 返回 listener 异常退出的错误. main 在 <-Done() 之后调.
+// 正常关闭 (Shutdown 主动调) 返 nil.
+func (s *Server) Err() error {
+	return s.httpErr
 }
 
 func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {

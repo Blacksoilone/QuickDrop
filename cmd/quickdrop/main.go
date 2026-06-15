@@ -390,6 +390,16 @@ func postInternal(path, body string) error {
 // initialPath 为空表示纯接收模式启动 (此时 initialReceive 必须 true, 否则 daemon 啥也不干).
 // initialReceive 表示 daemon 启动后立刻开启接收模式 + 弹接收窗.
 func runDaemon(initialPath string, initialReceive bool) {
+	// 全局 panic recover: 防 daemon 主 goroutine 任何一个 handler / goroutine
+	// panic 推倒整个进程. recover 后 log + 标准退出, 让 mDNS 下播 / 子窗清理跑到.
+	// 不补回归: panic 是真 bug, 应该当场修, 这里只是兜底防全局推倒.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("daemon panic: %v", r)
+			log.Printf("正在尝试优雅退出...")
+			tray.Quit()
+		}
+	}()
 	// 加载配置 (~/.quickdrop/config.json + env 覆盖). 失败用默认.
 	cfgMgr, err := config.Load()
 	if err != nil {
@@ -570,6 +580,19 @@ func runDaemon(initialPath string, initialReceive bool) {
 	onTrayConfig := func() {
 		winMgr.OpenConfigWindow(configURL)
 	}
+
+	// 监听 HTTP server 异常退出 (listener 被外部杀 / 网络栈炸 / 端口被夺):
+	// 触发 systray.Quit() → tray.Run 解阻塞 → onExit 跑标准清理路径.
+	// 比 log.Fatal 强: defer 会被执行, mDNS 下播 + 子窗清理 + 设备表 flush 都不会丢.
+	go func() {
+		<-srv.Done()
+		if err := srv.Err(); err != nil {
+			log.Printf("HTTP server 死了 (%v), 触发 daemon 优雅退出...", err)
+		}
+		// 触发 tray 退出 → tray.Run 解阻塞 → onExit 跑清理.
+		// 用导出的 tray.Quit() 而非直接 import systray, 包边界更整洁.
+		tray.Quit()
+	}()
 
 	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, onTrayPending, onTrayDevices, onTrayConfig, func() {
 		if disc != nil {
