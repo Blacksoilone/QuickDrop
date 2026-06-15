@@ -60,7 +60,13 @@ type Manager struct {
 
 // NewManager 创建一个 Manager. mode 决定 OpenForFile 的行为.
 // selfExe 必须是当前进程的可执行路径 (os.Executable()).
+//
+// 顺手初始化 JobObject (Windows): 保证 daemon 死时所有 webview 子进程同步死.
+// 失败仅 log, 不致命 - 退化成普通进程间关系 (用户得手动清理孤儿).
 func NewManager(mode Mode, selfExe string) *Manager {
+	if err := initJobObject(); err != nil {
+		log.Printf("初始化 JobObject 失败 (子窗不会跟 daemon 同生共死): %v", err)
+	}
 	return &Manager{
 		mode:    mode,
 		selfExe: selfExe,
@@ -228,6 +234,9 @@ func spawn(selfExe, url string) (*exec.Cmd, error) {
 
 // spawnSized fork `<selfExe> window <url> <width> <height>` 子进程.
 // width/height = 0 时子进程内用默认 264×316.
+//
+// Start 之后立刻 assignToJob: daemon 死时 OS 自动 SIGKILL 它.
+// assignToJob 失败仅 log, 子进程仍正常跑只是失去同步死保证.
 func spawnSized(selfExe, url string, width, height int) (*exec.Cmd, error) {
 	args := []string{"window", url}
 	if width > 0 || height > 0 {
@@ -236,6 +245,9 @@ func spawnSized(selfExe, url string, width, height int) (*exec.Cmd, error) {
 	cmd := exec.Command(selfExe, args...)
 	if err := cmd.Start(); err != nil {
 		return nil, err
+	}
+	if err := assignToJob(cmd); err != nil {
+		log.Printf("绑 webview 子进程到 JobObject 失败 (PID %d, 仍可独立运行): %v", cmd.Process.Pid, err)
 	}
 	log.Printf("打开 webview 子进程 PID %d 加载 %s (size=%dx%d)", cmd.Process.Pid, url, width, height)
 	// reaper: 等子进程退出, 防止僵尸 + 记录退出时间, 不阻塞 OpenForFile
