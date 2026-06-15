@@ -77,6 +77,10 @@ type ReceiveConfig struct {
 	// MaxFileSize 接收文件大小上限 (字节). 0 = 不限.
 	// 来自 peer 的 incoming 或手机 upload 超过都拒.
 	MaxFileSize int64 `json:"max_file_size"`
+	// DefaultOn daemon 启动时是否默认开启接收.
+	// true: 启动即可接收 (开机自启场景). false: 需手动开启 (安全模式).
+	// 默认 true. 注意: quickdrop recv 命令会强制开启 (即使配置为 false).
+	DefaultOn bool `json:"default_on"`
 }
 
 type UIConfig struct {
@@ -104,7 +108,8 @@ func Default() Config {
 			MdnsEnabled: true,
 		},
 		Receive: ReceiveConfig{
-			MaxFileSize: 0, // 不限
+			MaxFileSize: 0,    // 不限
+			DefaultOn:   true, // 默认开启接收
 		},
 		UI: UIConfig{
 			ToastsEnabled: true,

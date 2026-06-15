@@ -35,29 +35,28 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
 
 	"quickdrop/internal/qr"
+	"quickdrop/internal/receive"
+	"quickdrop/internal/transfer"
 )
 
 // Server 持有 daemon 状态 + 底层 http.Server.
 // 一次进程一个 Server, 通过 New + Start/Shutdown 管理生命周期.
 //
-// 当前发送文件 (absPath/fileName/fileSize) 用 mu 保护, SwapFile 可在运行中替换.
-// 纯接收模式启动时 absPath 为空, 发送类路由返回 404.
+// 发送文件通过 transfer.Manager 管理, SwapFile 可在运行中动态替换.
+// 接收状态通过 receive.Manager 管理, 初值由 config.Receive.DefaultOn 决定.
 type Server struct {
-	mu       sync.RWMutex
-	absPath  string // 待发送文件的绝对路径; "" 表示纯接收模式
-	fileName string // 文件名 (展示+下载头用)
-	fileSize string // 人类可读大小
+	mu sync.RWMutex
 
-	// receiveMode atomic.Bool: 是否开启接收模式. 默认 false → /upload 返回 404.
-	// 由 EnableReceive(bool) 切换. ADR-17 安全约束: 任何陌生人扫到发送 QR 都不能
-	// 往本机塞文件, 上传仅在接收模式开启时可用.
-	receiveMode atomic.Bool
+	// transfer 管理发送队列 (当前单文件, 未来多文件).
+	transfer *transfer.Manager
+
+	// receive 管理接收状态 + 策略 (配置驱动).
+	receive *receive.Manager
 
 	port       int    // HTTP 端口, 默认 8443; QUICKDROP_PORT env 可覆盖 (测试用)
 	homeURL    string // 电脑端发送 dashboard URL
@@ -230,7 +229,13 @@ type Peer struct {
 // New 装配 Server. rawPath 为空表示纯接收模式启动 (daemon 启动时无文件可发).
 // port 通常是 8443; 为支持多 daemon 同机测试可用 QUICKDROP_PORT env 覆盖.
 // 不启动 listener.
-func New(rawPath string, port int) (*Server, error) {
+// New 创建 Server 实例.
+// port: HTTP 监听端口 (0 = 默认 8443).
+// cfg: 运行时配置 (receive.default_on 决定接收初始状态).
+//
+// 注意: 构造时不传文件路径, 改由 SendFile(path) 动态设置.
+// 这样 daemon 长驻时不绑定启动时状态, 更灵活.
+func New(port int, cfg *receive.Config) (*Server, error) {
 	if port <= 0 {
 		port = 8443
 	}
@@ -247,17 +252,10 @@ func New(rawPath string, port int) (*Server, error) {
 		mobileURL:  baseURL + "/d",
 		uploadURL:  baseURL + "/u",
 		baseURL:    baseURL,
+		transfer:   transfer.NewManager(),
+		receive:    receive.NewManager(cfg, nil), // onToggle 稍后 SetReceiveCallback 注入
 	}
 
-	if rawPath != "" {
-		absPath, name, size, err := validateFile(rawPath)
-		if err != nil {
-			return nil, err
-		}
-		s.absPath = absPath
-		s.fileName = name
-		s.fileSize = size
-	}
 	return s, nil
 }
 
@@ -272,31 +270,32 @@ func (s *Server) MobileURL() string { return s.mobileURL }
 
 // HasFile 当前是否有可发送的文件. 用于 main 决定要不要开发送窗.
 func (s *Server) HasFile() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.absPath != ""
+	return s.transfer.HasCurrent()
 }
 
 // EnableReceive 开/关接收模式 (是否真正接受 /upload 上传). ADR-17 安全约束.
 // 触发 onReceive 回调让 main 起/关 receive webview.
 func (s *Server) EnableReceive(on bool) {
-	prev := s.receiveMode.Swap(on)
-	if prev != on {
-		log.Printf("接收模式: %v → %v", prev, on)
-		if s.onReceive != nil {
-			s.onReceive(on)
-		}
+	s.receive.Enable(on)
+	// receive.Manager 内部会触发 onToggle 回调 (tray checkbox 同步)
+	// 这里触发 onReceive 回调 (webview 同步)
+	// TODO: 优化 - receive.Manager 也可以管 onReceive, 不需要 Server 再转发
+	if s.onReceive != nil {
+		s.onReceive(on)
 	}
+	log.Printf("接收模式: → %v", on)
 }
 
 // IsReceiving 当前是否在接收模式.
-func (s *Server) IsReceiving() bool { return s.receiveMode.Load() }
+func (s *Server) IsReceiving() bool { return s.receive.IsEnabled() }
 
 // CurrentFileName 返回当前发送的文件名 (并发安全).
 func (s *Server) CurrentFileName() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.fileName
+	t := s.transfer.Current()
+	if t == nil {
+		return ""
+	}
+	return t.FileName
 }
 
 // SetOnSwap 注册文件切换回调, 用于 tray 更新 tooltip.
@@ -412,18 +411,13 @@ func (s *Server) emitPendingChange() {
 // SwapFile 把当前发送文件切换成 rawPath. 并发安全.
 // 用于 IPC: 第二次 quickdrop send Y 不重启进程, 直接更新这里.
 func (s *Server) SwapFile(rawPath string) error {
-	absPath, name, size, err := validateFile(rawPath)
-	if err != nil {
+	if err := s.transfer.SetCurrent(rawPath); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	s.absPath = absPath
-	s.fileName = name
-	s.fileSize = size
-	s.mu.Unlock()
-	log.Printf("切换发送文件: %s (%s)", absPath, size)
+	t := s.transfer.Current()
+	log.Printf("切换发送文件: %s (%d bytes)", t.FilePath, t.FileSize)
 	if s.onSwap != nil {
-		s.onSwap(name)
+		s.onSwap(t.FileName)
 	}
 	return nil
 }
@@ -481,8 +475,8 @@ func (s *Server) Start() {
 	s.httpSrv = &http.Server{Addr: fmt.Sprintf(":%d", s.port), Handler: mux}
 	s.httpDone = make(chan struct{})
 
-	if s.absPath != "" {
-		log.Printf("发送文件: %s (%s)", s.absPath, s.fileSize)
+	if t := s.transfer.Current(); t != nil {
+		log.Printf("发送文件: %s (%d bytes)", t.FilePath, t.FileSize)
 		log.Printf("电脑端:   %s", s.homeURL)
 		log.Printf("手机端:   %s", s.mobileURL)
 		log.Printf("直链:     %s/file", s.baseURL)
@@ -537,15 +531,13 @@ func (s *Server) Err() error {
 }
 
 func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	absPath, name := s.absPath, s.fileName
-	s.mu.RUnlock()
-	if absPath == "" {
+	t := s.transfer.Current()
+	if t == nil {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Disposition", contentDisposition(name))
-	http.ServeFile(w, r, absPath)
+	w.Header().Set("Content-Disposition", contentDisposition(t.FileName))
+	http.ServeFile(w, r, t.FilePath)
 }
 
 // handleQR 把 mobileURL 渲染成 PNG, 给 / dashboard 内嵌 <img src="/qr"> 用.
@@ -617,7 +609,7 @@ func (s *Server) handleReceiveDashboard(w http.ResponseWriter, r *http.Request) 
 // handleUploadForm /u : 手机端上传表单. 服务 web/dist/u.html.
 // 受 receiveMode 门禁: 关时 404.
 func (s *Server) handleUploadForm(w http.ResponseWriter, r *http.Request) {
-	if !s.receiveMode.Load() {
+	if !s.receive.IsEnabled() {
 		http.NotFound(w, r)
 		return
 	}
@@ -668,14 +660,19 @@ type serverInfo struct {
 
 // handleAPIInfo /api/info : Vue 前端拉服务状态 (当前文件 + 接收开关).
 func (s *Server) handleAPIInfo(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	name, size, has := s.fileName, s.fileSize, s.absPath != ""
-	s.mu.RUnlock()
+	t := s.transfer.Current()
+	var name, size string
+	has := false
+	if t != nil {
+		name = t.FileName
+		size = humanSize(t.FileSize)
+		has = true
+	}
 	info := serverInfo{
 		FileName:  name,
 		FileSize:  size,
 		HasFile:   has,
-		Receiving: s.receiveMode.Load(),
+		Receiving: s.receive.IsEnabled(),
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -947,9 +944,9 @@ func (s *Server) handleInternalPeerSend(w http.ResponseWriter, r *http.Request) 
 
 	// filePath 为空时用当前 daemon 的发送文件 (Vue dashboard "发送到 X" 走这条)
 	if body.FilePath == "" {
-		s.mu.RLock()
-		body.FilePath = s.absPath
-		s.mu.RUnlock()
+		if t := s.transfer.Current(); t != nil {
+			body.FilePath = t.FilePath
+		}
 		if body.FilePath == "" {
 			http.Error(w, "filePath 未指定且 daemon 当前无发送文件", http.StatusBadRequest)
 			return
@@ -1284,7 +1281,7 @@ func requireLocal(next http.HandlerFunc) http.HandlerFunc {
 // 只在 EnableReceive(true) 后真正接收 multipart. 路由本身始终注册 (避免重新挂 mux),
 // 关闭模式时返回 404 假装不存在, 不暴露 "QuickDrop 在跑但接收关了" 这条信息.
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
-	if !s.receiveMode.Load() {
+	if !s.receive.IsEnabled() {
 		http.NotFound(w, r)
 		return
 	}

@@ -41,6 +41,7 @@ import (
 	"quickdrop/internal/devices"
 	"quickdrop/internal/dialog"
 	"quickdrop/internal/discovery"
+	"quickdrop/internal/receive"
 	"quickdrop/internal/identity"
 	"quickdrop/internal/installer"
 	"quickdrop/internal/notify"
@@ -268,8 +269,8 @@ func runSend(rawPath string) {
 		log.Print("daemon 已切换, 客户端退出")
 		return
 	}
-	log.Print("未发现 daemon, 启动新的 daemon (发送模式)")
-	runDaemon(absPath, false)
+	log.Print("未发现 daemon, 启动新的 daemon (发送文件)")
+	runDaemon(absPath)
 }
 
 func runRecv() {
@@ -278,11 +279,14 @@ func runRecv() {
 		if err := notifyDaemonReceive("on"); err != nil {
 			log.Fatalf("通知 daemon 失败: %v", err)
 		}
-		log.Print("daemon 已切到接收, 客户端退出")
+		log.Print("daemon 已开启接收, 客户端退出")
 		return
 	}
-	log.Print("未发现 daemon, 启动新的 daemon (接收模式)")
-	runDaemon("", true)
+	log.Print("未发现 daemon, 启动新的 daemon")
+	// recv 命令明确表达"我要接收", 即使 config.Receive.DefaultOn=false 也强制开启.
+	// 通过环境变量 QUICKDROP_FORCE_RECEIVE 传给 runDaemon (临时方案, 后续可改函数参数).
+	os.Setenv("QUICKDROP_FORCE_RECEIVE", "1")
+	runDaemon("")
 }
 
 // runInstall 写入右键菜单注册表 + 弹 MessageBox 反馈.
@@ -388,9 +392,9 @@ func postInternal(path, body string) error {
 }
 
 // runDaemon: 起 HTTP server + 托盘 + webview 子进程管理, 阻塞直到用户点 "退出".
-// initialPath 为空表示纯接收模式启动 (此时 initialReceive 必须 true, 否则 daemon 啥也不干).
-// initialReceive 表示 daemon 启动后立刻开启接收模式 + 弹接收窗.
-func runDaemon(initialPath string, initialReceive bool) {
+// initialPath 为空表示纯 daemon 启动 (不发送文件), 可通过托盘/IPC 后续操作.
+// 接收状态由 config.Receive.DefaultOn 决定, quickdrop recv 命令会强制开启.
+func runDaemon(initialPath string) {
 	// 全局 panic recover: 防 daemon 主 goroutine 任何一个 handler / goroutine
 	// panic 推倒整个进程. recover 后 log + 标准退出, 让 mDNS 下播 / 子窗清理跑到.
 	// 不补回归: panic 是真 bug, 应该当场修, 这里只是兜底防全局推倒.
@@ -445,7 +449,9 @@ func runDaemon(initialPath string, initialReceive bool) {
 			"运行 `quickdrop install` 修复 (右键菜单 + URL scheme 一起装)")
 	}
 
-	srv, err := server.New(initialPath, port)
+	srv, err := server.New(port, &receive.Config{
+		DefaultOn: cfg.Receive.DefaultOn,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -454,6 +460,13 @@ func runDaemon(initialPath string, initialReceive bool) {
 	srv.SetPeerManager(peerMgrAdapter{peer.NewManager()})
 	srv.SetProgressHub(progressHubAdapter{progress.NewHub()})
 	srv.SetConfig(configAdapter{cfgMgr})
+
+	// 如果启动时指定了文件, 动态设置 (不在构造时传)
+	if initialPath != "" {
+		if err := srv.SwapFile(initialPath); err != nil {
+			log.Fatalf("设置初始发送文件失败: %v", err)
+		}
+	}
 
 	// 加载设备信任表 (ADR-20). 失败不致命, 退回到"所有设备 ask".
 	if devStore, err := devices.Load(); err == nil {
@@ -554,8 +567,10 @@ func runDaemon(initialPath string, initialReceive bool) {
 	if srv.HasFile() {
 		winMgr.OpenForFile(srv.HomeURL())
 	}
-	if initialReceive {
-		srv.EnableReceive(true) // 会触发 onReceive → 起接收窗 + 勾菜单
+	// 接收状态已在 Server.New 时由 config.Receive.DefaultOn 初始化.
+	// quickdrop recv 命令通过 QUICKDROP_FORCE_RECEIVE=1 强制开启 (即使 config 默认关闭).
+	if os.Getenv("QUICKDROP_FORCE_RECEIVE") == "1" {
+		srv.EnableReceive(true)
 	}
 
 	// 托盘 "接收文件" 菜单点击 → 切 server.EnableReceive (会再触发 onReceive 回调)
