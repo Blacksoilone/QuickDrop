@@ -49,7 +49,7 @@ var (
 // onPickFile:  用户点 "选文件发送..." 时调 (main 弹原生选择器 + SwapFile).
 // onExit:      用户点退出时调用 (典型用法: server.Shutdown()).
 //              onExit 在 systray.Quit() 之后, 进程返回前执行.
-func Run(shareURL, initialName string, onReceive func(on bool), onPending func(), onDevices func(), onConfig func(), onPickFile func(), onExit func()) {
+func Run(shareURL, initialName string, onReceive func(on bool), onPending func(), onConfig func(), onPickFile func(), onExit func()) {
 	onReady := func() {
 		systray.SetIcon(iconNormalBytes)
 		systray.SetTitle("QuickDrop")
@@ -63,8 +63,7 @@ func Run(shareURL, initialName string, onReceive func(on bool), onPending func()
 		mRecv := systray.AddMenuItemCheckbox("接收文件", "开启接收模式, 弹接收 QR 窗", false)
 		mPend := systray.AddMenuItem("待处理 (0)", "查看待接受/拒绝的文件传入")
 		mPend.Hide() // 默认隐藏, 有 pending 时显示
-		mDev := systray.AddMenuItem("设备管理", "查看已知设备 + 设/撤 信任/黑名单")
-		mCfg := systray.AddMenuItem("设置", "打开配置中心 + 设备管理")
+		mCfg := systray.AddMenuItem("设置", "打开配置中心 (包含设备管理)")
 
 		stateMu.Lock()
 		receiveItem = mRecv
@@ -104,10 +103,6 @@ func Run(shareURL, initialName string, onReceive func(on bool), onPending func()
 				case <-mPend.ClickedCh:
 					if onPending != nil {
 						onPending()
-					}
-				case <-mDev.ClickedCh:
-					if onDevices != nil {
-						onDevices()
 					}
 				case <-mCfg.ClickedCh:
 					if onConfig != nil {

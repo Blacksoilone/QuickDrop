@@ -586,15 +586,8 @@ func runDaemon(initialPath string) {
 		winMgr.OpenPendingWindow(pendingURL)
 	}
 
-	// 托盘 "设备管理" 菜单点击 → 起 devices dashboard 子窗 (单实例).
-	// 用 LocalURL: 子窗调 /internal/device-trust 修改设备信任, 需要 127.0.0.1.
-	devicesURL := srv.LocalURL() + "/v"
-	onTrayDevices := func() {
-		winMgr.OpenDevicesWindow(devicesURL)
-	}
-
 	// 托盘 "设置" 菜单点击 → 起配置中心子窗 (单实例, 960×640).
-	// 配置页里包含设备管理 section, 所以这是设备管理的主入口; /v 保留兼容.
+	// 配置页里包含设备管理 section, 是设备管理的唯一入口.
 	// 用 LocalURL: 子窗调 /internal/config-save + /internal/device-trust, 需要 127.0.0.1.
 	configURL := srv.LocalURL() + "/c"
 	onTrayConfig := func() {
@@ -635,7 +628,7 @@ func runDaemon(initialPath string) {
 		tray.Quit()
 	}()
 
-	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, onTrayPending, onTrayDevices, onTrayConfig, onTrayPickFile, func() {
+	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, onTrayPending, onTrayConfig, onTrayPickFile, func() {
 		if disc != nil {
 			disc.Close()
 		}
