@@ -268,6 +268,12 @@ func (s *Server) ReceiveURL() string { return s.receiveURL }
 // MobileURL 手机端发送目标 URL. 托盘 "复制扫码链接" 复制这个 (给朋友扫/打开).
 func (s *Server) MobileURL() string { return s.mobileURL }
 
+// LocalURL 返回 127.0.0.1 base URL. 用于 webview 子窗加载需要访问 /internal/* 路由的页面
+// (如设备管理 /v, 配置中心 /c, 待处理 /p). LAN IP 会被 requireLocal 中间件拒绝 (404).
+func (s *Server) LocalURL() string {
+	return fmt.Sprintf("http://127.0.0.1:%d", s.port)
+}
+
 // HasFile 当前是否有可发送的文件. 用于 main 决定要不要开发送窗.
 func (s *Server) HasFile() bool {
 	return s.transfer.HasCurrent()
@@ -275,15 +281,17 @@ func (s *Server) HasFile() bool {
 
 // EnableReceive 开/关接收模式 (是否真正接受 /upload 上传). ADR-17 安全约束.
 // 触发 onReceive 回调让 main 起/关 receive webview.
+// 状态未变化时无副作用 (不重复触发回调, 不重复 log).
 func (s *Server) EnableReceive(on bool) {
+	prev := s.receive.IsEnabled()
 	s.receive.Enable(on)
-	// receive.Manager 内部会触发 onToggle 回调 (tray checkbox 同步)
-	// 这里触发 onReceive 回调 (webview 同步)
-	// TODO: 优化 - receive.Manager 也可以管 onReceive, 不需要 Server 再转发
+	if prev == on {
+		return // 状态未变, 无需通知
+	}
+	log.Printf("接收模式: %v → %v", prev, on)
 	if s.onReceive != nil {
 		s.onReceive(on)
 	}
-	log.Printf("接收模式: → %v", on)
 }
 
 // IsReceiving 当前是否在接收模式.
