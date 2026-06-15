@@ -227,6 +227,90 @@ system.autostart.
 加入时机: 用户主动提"加 X"再做, 不需要全部一次性. config.json 已支持 partial body
 解析, 加字段无破坏性升级.
 
+### v0.12+ 架构重构 + Shell Extension (产品级必做)
+
+**背景**：早期快速迭代留下的技术债，现在统一清算。分 3 阶段推进。
+
+#### Phase 1: 发送/接收解耦 (~2 小时)
+
+**当前问题**：`runDaemon(path, receiveMode bool)` 把发送/接收建模成互斥"模式"，导致：
+- `quickdrop send` 强制关接收 → 用户发文件时不能收文件（反直觉）
+- `initialReceive` 参数让启动方式决定接收状态（应该由 config 决定）
+
+**修复**：
+1. config 加 `receive.default_on: bool` (默认 true) — 接收状态初值由配置决定
+2. `runDaemon(initialPath string)` 去掉 `initialReceive` 参数
+3. `quickdrop send` 改成：只 SwapFile，**不碰接收状态**
+4. `quickdrop recv` 改成：显式开接收（即使 config 默认关，这次也强制开）
+
+**交付**：test-peer 24/24 PASS + "send 时接收不被关" 验证通过
+
+#### Phase 2: Server 构造解耦文件 (~1 小时)
+
+**当前问题**：`Server.New(rawPath, port)` 构造时强耦合"当前发送文件"，空路径表示纯接收模式
+
+**修复**：
+1. `New(rawPath, port)` → `New(port)`
+2. main 改成：`srv := New(port); if path != "" { srv.SwapFile(path) }`
+
+**交付**：test-config 24/24 + test-peer 24/24 PASS
+
+#### Phase 3: 统一 dashboard (~4-6 小时，含 Vue)
+
+**当前问题**：`/` = 发送页，`/r` = 接收页，两个 dashboard 分离
+
+**修复**：
+1. Vue `/` 页改造：上半屏发送槽 + 下半屏接收槽，按实际状态显隐
+2. 删 `/r` 路由（接收页合并进 `/`）
+3. 删 `homeURL` / `receiveURL` 字段，只留 `baseURL`
+4. 托盘"复制扫码链接"改成"打开控制台"（指向 `/`）
+
+**交付**：全量手测 + 6 个 ps1
+
+---
+
+#### v0.13.0: Rust Shell Extension (产品级右键菜单)
+
+**目标**：替换当前右键菜单的 CLI shell exec 方式，改用原生 Windows Shell Extension（COM DLL）
+
+**技术选型**：
+- **语言**：Rust（内存安全编译器保证 > C++ 人工纪律）
+- **架构**：极简 DLL（< 300 行，只转发给 daemon）
+- **输出**：`quickdrop_menu_x64.dll` + `quickdrop_menu_x86.dll`（各 ~800 KB）
+
+**为什么必须上**：
+- 当前 CLI 方式：每次右键 fork 新进程（~50ms 延迟 + 进程开销）
+- Shell Extension：DLL 已被 Explorer 加载，调用 < 5ms
+- 功能扩展：可动态生成子菜单（"发给 Alice / Bob"）
+- 产品定位：跟 Dropbox / OneDrive 同级别的原生集成
+
+**为什么选 Rust 而非 C++**：
+- C++ 内存安全靠人工纪律（野指针/UAF 可能炸 Explorer）
+- Rust 编译器强制保证（borrow checker + lifetime）
+- 长期维护：Rust 重构安全，C++ 改一行怕炸一片
+
+**时间表**：
+```
+Week 1-2: Phase 1-3 架构重构（API 稳定）
+Week 3:   Shell Extension 开发（Rust）
+  Day 1-2: 骨架 + COM 接口
+  Day 3-4: HTTP 调用 + 测试
+  Day 5:   x86 编译 + 双架构注册
+  Day 6-7: 压测 + bug 修复
+Week 4:   集成测试 + 签名 + 发布
+```
+
+**详细规范**：见 [docs/shell-extension-rust.md](./docs/shell-extension-rust.md)（含代码骨架 + 环境部署 + 验收标准）
+
+**交付**：
+- [ ] 右键任意文件看到"通过 QuickDrop 发送"
+- [ ] 点菜单 → daemon 收到请求 → 弹 QR 窗
+- [ ] 连续右键 100 次不崩 Explorer
+- [ ] DLL < 1 MB，已签名
+- [ ] test-config + test-peer 回归通过
+
+---
+
 ### v0.12+ 交互设计待办 (UX 方向)
 
 经 v0.11.2 验证后, 当前 "开机自启 + 常驻接收" 场景下 daemon 寿命合理, 不需改退出逻辑.
@@ -237,11 +321,9 @@ system.autostart.
   指向空状态, 用户复制了发给朋友是空白页. 现在 PC↔PC 已经通过 `/internal/peer-send`
   直发 + 设备表 trust 走通了, 这个菜单项可以从主路径降级为"高级选项"或直接移除.
 
-- **加 "选文件以发送" UI 入口**:
-  当前发送只能 (a) 右键 → "通过 QuickDrop 发送"  或 (b) 拖文件到 .exe.
-  对不愿打开文件资源管理器再关上的用户, 应该提供托盘菜单或 Config 页里一个
-  "选文件发送" 按钮, 弹原生文件选择器 → 走 SwapFile 流程. 跟现有 send 命令
-  共享后端, 仅 UI 新增. 大约 30 行 Go + 一个托盘菜单项.
+- ✅ **加 "选文件以发送" UI 入口** (v0.12.0 已做):
+  托盘菜单"选文件发送..."→ 弹原生文件选择器 → SwapFile + 弹 QR 窗.
+  internal/dialog 包封装 Win32 GetOpenFileNameW, 30 行 Go 实现.
 
 不做的判断 (审过, 故意不做):
   - send / 拖拽不会杀常驻 daemon (probeDaemon + 客户端模式 IPC 已覆盖)
