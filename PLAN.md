@@ -1,4 +1,4 @@
-# QuickDrop 执行进度
+﻿# QuickDrop 执行进度
 
 > 产品蓝图、ADR、Phase 2-4 规划见 [QuickDrop.md](./QuickDrop.md)。
 > 本文档只写**进度、环境、遇到的问题、待办**。
@@ -192,156 +192,134 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
 - **旧版 daemon 占着 8443 时新版起不来**:probeDaemon 只认 `X-QuickDrop:1` header,旧版没此 header → 判定"不是 daemon"→ 走 daemon 模式 → bind fail。**升级场景需要先 kill 旧版**。后续可考虑 daemon 模式 bind fail 时给用户友好提示
 - **systray + webview 不能同进程**:两者都要 main goroutine 跑 Windows 消息循环,放一起会抢消息/调试地狱(见 webview issue #650, systray issue #195)。**方案**:webview 单独 fork 子进程,daemon 进程持 PID 管理生命周期(replace/keep/first-only 三策略)
 
-## 5. 待办
 
-### 下一步候选
+## 5. 当前状态总结
 
-Phase 2 主体已交付 (2.2/2.3/2.4/2.5a-e/2.7/2.10/2.11/2.13/2.6).
-v0.10.x 小修 (2.8 + 2.9 + 托盘设备管理) 已完成.
-v0.11.0 配置中心 (8 项配置 + UI + 设备合并) 已完成.
-剩余:
+### 已完成 (按版本)
 
-- **Phase 3** 起步: HTTPS via lancert.dev + PWA manifest, 真机适配
+#### v0.10.x — Phase 2 收尾
+- ✅ 托盘"设备管理"菜单 + 通知 + WebSocket 进度
 
-### v0.11.x / v0.12 配置项扩展池 (用户暂缓, 后续按需挑)
+#### v0.11.0 — 配置中心
+- ✅ `internal/config` 包 (8 字段, 三层加载: 默认 < JSON < env)
+- ✅ 8 项可调配置: download.dir / conflict / port / mdns / max_file_size / toast / reveal / autostart
+- ✅ 配置中心页面 (`/c`, 现代化 UI, 960×640)
+- ✅ 设备管理合并到配置中心 (废弃独立 `/v` 页)
+- ✅ 托盘"设置"菜单入口
 
-第一轮 (v0.11.0) 已交付 8 项: download.dir / download.conflict / server.port /
-server.mdns_enabled / receive.max_file_size / ui.toasts_enabled / ui.reveal_on_done /
-system.autostart.
+#### v0.11.1 — 孤儿 webview 修复 (JobObject)
+- ✅ `internal/window/job_windows.go` Win32 JobObject + KILL_ON_JOB_CLOSE
+- ✅ daemon 死时 OS 自动 SIGKILL 所有 webview 子进程
 
-下面这些是用户审过的但说"暂时不做, 后续可能添加"的候选, 各自的语义已经讨论过:
+#### v0.11.2 — daemon 优雅退出
+- ✅ `log.Fatalf` → `log.Printf + close(httpDone)` + tray.Quit
+- ✅ runDaemon 全局 `defer recover` 兜底主 goroutine panic
+- ✅ 修复 listener 异常时 daemon 跳过 cleanup 的 bug
+
+#### v0.11.3 — 发送/接收解耦 (架构重构)
+- ✅ 发送 = 离散动作, 接收 = 持续状态 (config 驱动)
+- ✅ `internal/transfer.Manager` 管理发送队列 (预留多文件)
+- ✅ `internal/receive.Manager` 管理接收状态 + 策略 (预留 auto_accept_trusted)
+- ✅ `runDaemon(initialPath string)` 删 `initialReceive` 参数
+- ✅ `Server.New(port, *receive.Config)` 不强求初始文件路径
+- ✅ `quickdrop recv` 通过 env `QUICKDROP_FORCE_RECEIVE=1` 强制开启
+- ✅ config 加 `receive.default_on` (默认 true)
+- ✅ 删除托盘"接收文件" checkbox (改由配置中心常用页控制)
+- ✅ 删除独立 `/v` 路由 (设备管理只走 `/c#devices`)
+- ✅ 修复 webview 子窗 → /internal/* 404 (改用 LocalURL 127.0.0.1)
+
+#### v0.12.0 — 用户体验全面打磨
+- ✅ "选文件发送..." 托盘菜单 + Win32 GetOpenFileNameW
+- ✅ "显示接收 QR 码" 托盘菜单
+- ✅ 双击 exe 默认启动 daemon (无参 = runDaemon(""))
+- ✅ "复制扫码链接" 反馈 (Toast 组件 + 复制成功提示)
+- ✅ 文件夹选择器 (Win32 SHBrowseForFolder + /internal/pick-folder API)
+- ✅ "注册到系统" 取代 "安装" (UI 用词改进)
+- ✅ 系统集成 API (/internal/system-{register,unregister,status})
+- ✅ 配置页"系统"区域: 显示注册状态 + 注册/取消注册按钮
+- ✅ Linux 痕迹清理 (~/路径 → C:\Users\..., daemon → 后台服务)
+- ✅ 托盘菜单简化 (合并设备管理到设置, 去掉冗余项)
+- ✅ 接收开关重设计:
+  - 配置中心"常用"页: 当前接收状态 toggle (运行时, 立即生效)
+  - 配置中心"接收"页: 默认接收状态 toggle (启动初值, 二次确认)
+
+#### v0.12.x — 设备管理增强 + 无边框窗口 + 图标
+- ✅ Lucide 图标库 (lucide-vue-next, 替代所有 emoji/Unicode)
+- ✅ 设备管理重写 (DevicePanel.vue 完全重写):
+  - 搜索栏 (按名称/别名/UUID)
+  - 筛选下拉 (全部/信任/待决策/黑名单)
+  - 排序下拉 (最近活跃/名称)
+  - 分组展示 (信任/待决策/黑名单, 黑名单默认折叠)
+  - 设备别名 (行内编辑, 回车保存)
+  - 删除设备 (二次确认弹窗)
+  - 操作菜单 (⋯ 按钮展开)
+- ✅ 后端: `Device.Alias` 字段 + `SetAlias` / `Delete` 方法
+- ✅ 后端 API: `/internal/device-alias` + `/internal/device-delete`
+- ✅ 无边框窗口:
+  - Win32 API 移除 WS_CAPTION (`MakeBorderless`)
+  - JS bind 调 Win32 SendMessage(WM_NCLBUTTONDOWN, HTCAPTION) 实现拖动
+  - 配置项 `ui.borderless_windows` (默认 true)
+  - QR 窗口 (Dashboard/Receive): 整窗可拖动 + 浮动关闭按钮 (MiniShell 组件)
+  - 配置窗口 (Config): 自定义标题栏可拖动
+  - 修复关键 bug: spawnSizedWithOptions 在 width=0 时跳过 size 参数,
+    导致 borderless 标志位错位 → 改为扫描全部参数
+- ✅ EXE 嵌入图标 (rsrc + .syso):
+  - assets/icon-source.svg 源文件
+  - cmd/quickdrop/icon.syso (rsrc 生成)
+  - 任务栏 / 任务管理器 / 资源管理器 都显示自定义图标
+- ✅ 替换托盘图标 (favicon.ico → internal/tray/icon.ico)
+
+### 进行中
+
+无 (准备 commit + tag v0.13.0)
+
+### 待启动
+
+#### Phase 3 — 适配朋友机型
+- HTTPS via lancert.dev 通配证书
+- PWA manifest + Service Worker
+- iOS HEIC 转换
+- 微信内置浏览器适配
+
+#### Phase 4 — 体验打磨 (待评估)
+- **Rust Shell Extension** (详见 [docs/shell-extension-rust.md](./docs/shell-extension-rust.md))
+  - 替换 CLI 右键 (~50ms fork) → 原生 IContextMenu (<5ms)
+  - 工程量: ~1 周, 但产品级体验
+- 自动更新
+- 剪贴板共享
+
+## 6. 配置项扩展池 (用户暂缓, 后续按需挑)
+
+第一轮已交付: download.dir / download.conflict / server.port / server.mdns_enabled /
+receive.max_file_size / receive.default_on / ui.toasts_enabled / ui.reveal_on_done /
+ui.borderless_windows / system.autostart.
+
+下面这些是用户审过但说"暂时不做"的候选, 各自语义已讨论过:
 
 - **receive.ask_before_accept** — 接收前是否弹确认窗 (默认 false: 当前直接 toast)
-- **receive.max_pending** — 接收数量上限 (防 toast 轰炸; 触上限后新 incoming 直接 reject)
+- **receive.max_pending** — 接收数量上限 (防 toast 轰炸)
 - **receive.pending_ttl_sec** — pending TTL 可配 (现在硬编码 30 min)
-- **receive.default_on** — daemon 启动是否默认开接收模式 (现在默认关)
 - **ui.window.send_auto_close_sec** — 发送窗自动关闭 (现在常驻)
 - **ui.window.width / height / dpi** — 窗口尺寸 / DPI 偏好
-- **log.path / log.level** — 日志路径 / 级别 (现在固定 %TEMP%\quickdrop.log)
+- **log.path / log.level** — 日志路径 / 级别
 - **net.https_cert_path / key_path** — HTTPS 证书路径 (Phase 3)
 - **ui.hotkey.global** — 全局热键 (Ctrl+Alt+Q 等)
-- **system.post_receive_hook** — 接收完成自定义命令钩子 (用户脚本)
-- **identity.broadcast_name** — 设备显示名独立于 hostname (现在用 identity.Name)
-- **ui.window_mode** — 当前是 env QUICKDROP_WINDOW_MODE (replace/keep/first-only) 应进 config
+- **system.post_receive_hook** — 接收完成自定义命令钩子
+- **identity.broadcast_name** — 设备显示名独立于 hostname
+- **ui.window_mode** — 当前是 env QUICKDROP_WINDOW_MODE 应进 config
 
-加入时机: 用户主动提"加 X"再做, 不需要全部一次性. config.json 已支持 partial body
-解析, 加字段无破坏性升级.
+加入时机: 用户主动提"加 X"再做. config.json 已支持 partial body 解析, 加字段无破坏性升级.
 
-### v0.12+ 架构重构 + Shell Extension (产品级必做)
+## 7. 待补验收
 
-**背景**：早期快速迭代留下的技术债，现在统一清算。分 3 阶段推进。
-
-#### Phase 1: 发送/接收解耦 (~2 小时)
-
-**当前问题**：`runDaemon(path, receiveMode bool)` 把发送/接收建模成互斥"模式"，导致：
-- `quickdrop send` 强制关接收 → 用户发文件时不能收文件（反直觉）
-- `initialReceive` 参数让启动方式决定接收状态（应该由 config 决定）
-
-**修复**：
-1. config 加 `receive.default_on: bool` (默认 true) — 接收状态初值由配置决定
-2. `runDaemon(initialPath string)` 去掉 `initialReceive` 参数
-3. `quickdrop send` 改成：只 SwapFile，**不碰接收状态**
-4. `quickdrop recv` 改成：显式开接收（即使 config 默认关，这次也强制开）
-
-**交付**：test-peer 24/24 PASS + "send 时接收不被关" 验证通过
-
-#### Phase 2: Server 构造解耦文件 (~1 小时)
-
-**当前问题**：`Server.New(rawPath, port)` 构造时强耦合"当前发送文件"，空路径表示纯接收模式
-
-**修复**：
-1. `New(rawPath, port)` → `New(port)`
-2. main 改成：`srv := New(port); if path != "" { srv.SwapFile(path) }`
-
-**交付**：test-config 24/24 + test-peer 24/24 PASS
-
-#### Phase 3: 统一 dashboard (~4-6 小时，含 Vue)
-
-**当前问题**：`/` = 发送页，`/r` = 接收页，两个 dashboard 分离
-
-**修复**：
-1. Vue `/` 页改造：上半屏发送槽 + 下半屏接收槽，按实际状态显隐
-2. 删 `/r` 路由（接收页合并进 `/`）
-3. 删 `homeURL` / `receiveURL` 字段，只留 `baseURL`
-4. 托盘"复制扫码链接"改成"打开控制台"（指向 `/`）
-
-**交付**：全量手测 + 6 个 ps1
-
----
-
-#### v0.13.0: Rust Shell Extension (产品级右键菜单)
-
-**目标**：替换当前右键菜单的 CLI shell exec 方式，改用原生 Windows Shell Extension（COM DLL）
-
-**技术选型**：
-- **语言**：Rust（内存安全编译器保证 > C++ 人工纪律）
-- **架构**：极简 DLL（< 300 行，只转发给 daemon）
-- **输出**：`quickdrop_menu_x64.dll` + `quickdrop_menu_x86.dll`（各 ~800 KB）
-
-**为什么必须上**：
-- 当前 CLI 方式：每次右键 fork 新进程（~50ms 延迟 + 进程开销）
-- Shell Extension：DLL 已被 Explorer 加载，调用 < 5ms
-- 功能扩展：可动态生成子菜单（"发给 Alice / Bob"）
-- 产品定位：跟 Dropbox / OneDrive 同级别的原生集成
-
-**为什么选 Rust 而非 C++**：
-- C++ 内存安全靠人工纪律（野指针/UAF 可能炸 Explorer）
-- Rust 编译器强制保证（borrow checker + lifetime）
-- 长期维护：Rust 重构安全，C++ 改一行怕炸一片
-
-**时间表**：
-```
-Week 1-2: Phase 1-3 架构重构（API 稳定）
-Week 3:   Shell Extension 开发（Rust）
-  Day 1-2: 骨架 + COM 接口
-  Day 3-4: HTTP 调用 + 测试
-  Day 5:   x86 编译 + 双架构注册
-  Day 6-7: 压测 + bug 修复
-Week 4:   集成测试 + 签名 + 发布
-```
-
-**详细规范**：见 [docs/shell-extension-rust.md](./docs/shell-extension-rust.md)（含代码骨架 + 环境部署 + 验收标准）
-
-**交付**：
-- [ ] 右键任意文件看到"通过 QuickDrop 发送"
-- [ ] 点菜单 → daemon 收到请求 → 弹 QR 窗
-- [ ] 连续右键 100 次不崩 Explorer
-- [ ] DLL < 1 MB，已签名
-- [ ] test-config + test-peer 回归通过
-
----
-
-### v0.12+ 交互设计待办 (UX 方向)
-
-经 v0.11.2 验证后, 当前 "开机自启 + 常驻接收" 场景下 daemon 寿命合理, 不需改退出逻辑.
-但发现两个 UX 演进方向, 等用户实际有需求时再做:
-
-- **PC↔PC 走 peer-send, 废弃 "复制扫码链接"**:
-  现在托盘"复制扫码链接"复制的是 `/d` URL (手机端发送页), 在长驻 daemon 无文件时
-  指向空状态, 用户复制了发给朋友是空白页. 现在 PC↔PC 已经通过 `/internal/peer-send`
-  直发 + 设备表 trust 走通了, 这个菜单项可以从主路径降级为"高级选项"或直接移除.
-
-- ✅ **加 "选文件以发送" UI 入口** (v0.12.0 已做):
-  托盘菜单"选文件发送..."→ 弹原生文件选择器 → SwapFile + 弹 QR 窗.
-  internal/dialog 包封装 Win32 GetOpenFileNameW, 30 行 Go 实现.
-
-不做的判断 (审过, 故意不做):
-  - send / 拖拽不会杀常驻 daemon (probeDaemon + 客户端模式 IPC 已覆盖)
-  - daemon 永不自动退出是好默认 (用户唯一退出路径 = 托盘"退出")
-  - 暂不加 exit_after_send / idle_exit_min 配置 (用户审过明确表态: 主动退即可)
-
-### 待补验收
-
-- ⏸ TEST.md 用例 6 多手机并发(等借到第二台手机)
+- ⏸ TEST.md 用例 6 多手机并发 (等借到第二台手机)
 - ⏸ Win11 实地复核右键菜单显示位置 (Shift+右键 / "显示更多选项")
 - ⏸ Vue 页面在真手机浏览器渲染 (UA 测试, 主要是 iOS Safari 兼容)
-- ⏸ PC→PC 互传需要第二台 Windows PC (现阶段缺设备)
+- ⏸ PC↔PC 互传需要第二台 Windows PC
 
-### 后续 Phase 2 才做的小项
+## 8. 已知小项 (低优先级)
 
-- 托盘图标用绘图软件画一个像样的(目前是纯蓝 16x16 占位)
-- daemon 模式发现端口被占但响应不是 QuickDrop 时,给用户更友好的报错
-- `QUICKDROP_WINDOW_MODE` 配置项最终应进配置页 UI (现在只能 env 设置)
-- 接收完成后自动关闭接收模式 (现在要用户手动点"停止接收"或托盘取消勾,有可能忘了一直开着)
-- Win11 现代右键菜单 (顶级显示, 不需 Shift): 需要 MSIX sparse package + IExplorerCommand,工程量大,留 Phase 4
-- 文件切换后 webview 旧窗内容不会自动刷新 (用户得 F5 / 重开窗才看到新文件名),等 2.8 WebSocket 解决
+- daemon 模式发现端口被占但响应不是 QuickDrop 时, 给用户更友好的报错
+- 文件切换后 webview 旧窗内容不会自动刷新 (考虑用 WebSocket 主动推送)
+- 设置页"发送"分组当前为空 (待设计配置项)
+- 红点告警图标和普通图标当前用同一个 (favicon.ico), 后续可做带红点变体
