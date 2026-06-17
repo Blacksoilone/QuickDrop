@@ -1,5 +1,6 @@
 # build artifacts
 /quickdrop.exe
+/quickdrop.exe.backup
 *.exe~
 
 # Vue / Vite

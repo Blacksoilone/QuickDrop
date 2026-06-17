@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 待处理 incoming 列表页 (托盘 "待处理 (N)" 点开走这里).
-// 列出 pending 队列, 每条可接受/拒绝. 接受后 daemon 异步 Pull 文件.
+// 列出 pending 队列, 每条可接受/拒绝. 接受后后台服务异步 Pull 文件.
 // 同时订阅 /ws 进度事件, 给"已接受"的条目显示实时进度条.
 import { onMounted, onUnmounted, ref } from "vue";
 import {
@@ -101,7 +101,7 @@ function percent(e: ProgressEvent): number {
 </script>
 
 <template>
-  <button class="close" title="关闭窗口 (daemon 继续运行)" @click="closeWindow">×</button>
+  <button class="close" title="关闭窗口 (后台服务继续运行)" @click="closeWindow">×</button>
   <div class="wrap">
     <h1>待处理文件传入</h1>
 

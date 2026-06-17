@@ -46,29 +46,32 @@ func ParseMode(s string) Mode {
 
 // Manager 由 daemon 进程持有. fork/kill webview 子进程.
 type Manager struct {
-	mu        sync.Mutex
-	mode      Mode
-	selfExe   string      // os.Executable() 的结果, fork 用
-	cur       *exec.Cmd   // ModeReplace 持有当前发送窗子进程
-	keepCmds  []*exec.Cmd // ModeKeep 持有所有发送窗子进程 (退出时一并清理)
-	firstUsed bool        // ModeFirstOnly 记是否已经开过发送窗
-	recvCmd   *exec.Cmd   // 接收窗子进程 (独立于 mode, 单实例)
-	pendCmd   *exec.Cmd   // pending dashboard 子进程 (单实例; 用户从托盘点开)
-	cfgCmd    *exec.Cmd   // 配置中心子进程 (单实例; 用户从托盘 "设置" 点开, 包含设备管理)
+	mu              sync.Mutex
+	mode            Mode
+	selfExe         string      // os.Executable() 的结果, fork 用
+	borderless      bool        // 是否使用无边框窗口
+	cur             *exec.Cmd   // ModeReplace 持有当前发送窗子进程
+	keepCmds        []*exec.Cmd // ModeKeep 持有所有发送窗子进程 (退出时一并清理)
+	firstUsed       bool        // ModeFirstOnly 记是否已经开过发送窗
+	recvCmd         *exec.Cmd   // 接收窗子进程 (单实例; 用户从托盘点 "显示接收 QR 码")
+	pendCmd         *exec.Cmd   // pending dashboard 子进程 (单实例; 用户从托盘点开)
+	cfgCmd          *exec.Cmd   // 配置中心子进程 (单实例; 用户从托盘 "设置" 点开, 包含设备管理)
 }
 
 // NewManager 创建一个 Manager. mode 决定 OpenForFile 的行为.
 // selfExe 必须是当前进程的可执行路径 (os.Executable()).
+// borderless 控制是否使用无边框窗口（移除系统标题栏）.
 //
 // 顺手初始化 JobObject (Windows): 保证 daemon 死时所有 webview 子进程同步死.
 // 失败仅 log, 不致命 - 退化成普通进程间关系 (用户得手动清理孤儿).
-func NewManager(mode Mode, selfExe string) *Manager {
+func NewManager(mode Mode, selfExe string, borderless bool) *Manager {
 	if err := initJobObject(); err != nil {
 		log.Printf("初始化 JobObject 失败 (子窗不会跟 daemon 同生共死): %v", err)
 	}
 	return &Manager{
-		mode:    mode,
-		selfExe: selfExe,
+		mode:       mode,
+		selfExe:    selfExe,
+		borderless: borderless,
 	}
 }
 
@@ -83,7 +86,7 @@ func (m *Manager) OpenForFile(url string) {
 		if m.firstUsed {
 			return
 		}
-		cmd, err := spawn(m.selfExe, url)
+		cmd, err := m.spawnWindow(url, 0, 0)
 		if err != nil {
 			log.Printf("打开 webview 子进程失败: %v", err)
 			return
@@ -92,7 +95,7 @@ func (m *Manager) OpenForFile(url string) {
 		m.firstUsed = true
 
 	case ModeKeep:
-		cmd, err := spawn(m.selfExe, url)
+		cmd, err := m.spawnWindow(url, 0, 0)
 		if err != nil {
 			log.Printf("打开 webview 子进程失败: %v", err)
 			return
@@ -105,7 +108,7 @@ func (m *Manager) OpenForFile(url string) {
 				log.Printf("杀旧 webview 子进程 (PID %d) 失败: %v", m.cur.Process.Pid, err)
 			}
 		}
-		cmd, err := spawn(m.selfExe, url)
+		cmd, err := m.spawnWindow(url, 0, 0)
 		if err != nil {
 			log.Printf("打开 webview 子进程失败: %v", err)
 			return
@@ -137,6 +140,24 @@ func (m *Manager) Shutdown() {
 	}
 }
 
+// OpenReceiveWindow 起一个接收窗子进程 (单实例).
+// 用户从托盘点 "显示接收 QR 码" 时调. 重复点会先杀旧的避免堆积.
+func (m *Manager) OpenReceiveWindow(url string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.recvCmd != nil && m.recvCmd.Process != nil {
+		if err := m.recvCmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			log.Printf("杀旧接收窗 (PID %d) 失败: %v", m.recvCmd.Process.Pid, err)
+		}
+	}
+	cmd, err := m.spawnWindow(url, 0, 0)
+	if err != nil {
+		log.Printf("打开接收 webview 子进程失败: %v", err)
+		return
+	}
+	m.recvCmd = cmd
+}
+
 // OpenPendingWindow 起一个 pending dashboard 子进程 (单实例).
 // 用户从托盘点 "待处理 (N)" 时调. 重复点会先杀旧的避免堆积.
 func (m *Manager) OpenPendingWindow(url string) {
@@ -147,7 +168,7 @@ func (m *Manager) OpenPendingWindow(url string) {
 			log.Printf("杀旧 pending 窗 (PID %d) 失败: %v", m.pendCmd.Process.Pid, err)
 		}
 	}
-	cmd, err := spawn(m.selfExe, url)
+	cmd, err := m.spawnWindow(url, 0, 0)
 	if err != nil {
 		log.Printf("打开 pending webview 子进程失败: %v", err)
 		return
@@ -166,7 +187,7 @@ func (m *Manager) OpenConfigWindow(url string) {
 			log.Printf("杀旧 config 窗 (PID %d) 失败: %v", m.cfgCmd.Process.Pid, err)
 		}
 	}
-	cmd, err := spawnSized(m.selfExe, url, 960, 640)
+	cmd, err := m.spawnWindow(url, 960, 640)
 	if err != nil {
 		log.Printf("打开 config webview 子进程失败: %v", err)
 		return
@@ -174,35 +195,9 @@ func (m *Manager) OpenConfigWindow(url string) {
 	m.cfgCmd = cmd
 }
 
-// OpenReceiveWindow 起一个接收 dashboard 子进程. 单实例.
-// 若已存在 (用户连续多次点"接收文件"), 先杀旧的.
-func (m *Manager) OpenReceiveWindow(url string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.recvCmd != nil && m.recvCmd.Process != nil {
-		if err := m.recvCmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			log.Printf("杀旧接收窗 (PID %d) 失败: %v", m.recvCmd.Process.Pid, err)
-		}
-	}
-	cmd, err := spawn(m.selfExe, url)
-	if err != nil {
-		log.Printf("打开接收 webview 子进程失败: %v", err)
-		return
-	}
-	m.recvCmd = cmd
-}
-
-// CloseReceiveWindow 关掉接收窗子进程 (如果在跑).
-// 由 server.EnableReceive(false) 回调触发.
-func (m *Manager) CloseReceiveWindow() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.recvCmd != nil && m.recvCmd.Process != nil {
-		if err := m.recvCmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			log.Printf("关闭接收窗 (PID %d) 失败: %v", m.recvCmd.Process.Pid, err)
-		}
-	}
-	m.recvCmd = nil
+// spawnWindow 根据 Manager 的 borderless 配置启动窗口
+func (m *Manager) spawnWindow(url string, width, height int) (*exec.Cmd, error) {
+	return spawnSizedWithOptions(m.selfExe, url, width, height, m.borderless)
 }
 
 // spawn fork 一个 `<selfExe> window <url>` 子进程, 立刻返回不等它结束.
@@ -217,9 +212,22 @@ func spawn(selfExe, url string) (*exec.Cmd, error) {
 // Start 之后立刻 assignToJob: daemon 死时 OS 自动 SIGKILL 它.
 // assignToJob 失败仅 log, 子进程仍正常跑只是失去同步死保证.
 func spawnSized(selfExe, url string, width, height int) (*exec.Cmd, error) {
+	return spawnSizedWithOptions(selfExe, url, width, height, false)
+}
+
+// spawnSizedBorderless fork 无边框窗口子进程
+func spawnSizedBorderless(selfExe, url string, width, height int) (*exec.Cmd, error) {
+	return spawnSizedWithOptions(selfExe, url, width, height, true)
+}
+
+// spawnSizedWithOptions 内部实现，支持无边框选项
+func spawnSizedWithOptions(selfExe, url string, width, height int, borderless bool) (*exec.Cmd, error) {
 	args := []string{"window", url}
 	if width > 0 || height > 0 {
 		args = append(args, fmt.Sprintf("%d", width), fmt.Sprintf("%d", height))
+	}
+	if borderless {
+		args = append(args, "borderless")
 	}
 	cmd := exec.Command(selfExe, args...)
 	if err := cmd.Start(); err != nil {
@@ -228,7 +236,11 @@ func spawnSized(selfExe, url string, width, height int) (*exec.Cmd, error) {
 	if err := assignToJob(cmd); err != nil {
 		log.Printf("绑 webview 子进程到 JobObject 失败 (PID %d, 仍可独立运行): %v", cmd.Process.Pid, err)
 	}
-	log.Printf("打开 webview 子进程 PID %d 加载 %s (size=%dx%d)", cmd.Process.Pid, url, width, height)
+	modeStr := ""
+	if borderless {
+		modeStr = " (borderless)"
+	}
+	log.Printf("打开 webview 子进程 PID %d 加载 %s (size=%dx%d%s)", cmd.Process.Pid, url, width, height, modeStr)
 	// reaper: 等子进程退出, 防止僵尸 + 记录退出时间, 不阻塞 OpenForFile
 	go func() {
 		if err := cmd.Wait(); err != nil {
@@ -244,4 +256,9 @@ func spawnSized(selfExe, url string, width, height int) (*exec.Cmd, error) {
 // 必须在子进程的 main goroutine 调用.
 func Run(url, title string, width, height int) {
 	runWebview(url, title, width, height)
+}
+
+// RunBorderless 运行无边框 webview 窗口（子进程入口）
+func RunBorderless(url, title string, width, height int) {
+	runWebviewBorderless(url, title, width, height)
 }

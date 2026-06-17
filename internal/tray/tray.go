@@ -25,13 +25,11 @@ var iconNormalBytes []byte
 //go:embed icon-alert.ico
 var iconAlertBytes []byte
 
-// receiveItem: 模块级保存接收菜单项, 给 SetReceiveChecked 外部同步用.
 // pendingItem: 模块级保存 "待处理 (N)" 菜单项, 给 SetPendingCount 改文本+显隐用.
 // systray 没有暴露按 id 拿菜单项的 API, 只能这样.
 // 用 mu 保护避免 Run 还没建好菜单时外部 setter 拿到 nil.
 var (
 	stateMu      sync.Mutex
-	receiveItem  *systray.MenuItem
 	pendingItem  *systray.MenuItem
 	currentName  string // 当前文件名 (tooltip 用)
 	pendingCount int    // 当前待处理数 (tooltip 用)
@@ -40,16 +38,15 @@ var (
 // Run 启动托盘 (阻塞), 直到用户点 "退出" 或 systray.Quit() 被外部触发.
 //
 // shareURL:    给朋友的链接 (mobileURL, 指向 /d 手机端发送页). "复制扫码链接" 复制这个.
+// receiveURL:  接收页链接 (指向 /r 手机端接收页). "显示接收 QR 码" 打开这个.
 // initialName: 初始发送的文件名, 显示在 tooltip 上.
-// onReceive:   用户点 "接收文件" / "停止接收" 时调 (传入新状态 on/off).
 // onPending:   用户点 "待处理 (N)" 时调 (main 起 pending webview 子窗加载 /p).
-// onDevices:   用户点 "设备管理" 时调 (main 起 devices webview 子窗加载 /v).
-//              v0.11.0+ 已合并到 /c#devices, 这个回调暂时保留: 让 main 决定是不是用 onConfig 替代.
 // onConfig:    用户点 "设置" 时调 (main 起 config webview 子窗加载 /c).
 // onPickFile:  用户点 "选文件发送..." 时调 (main 弹原生选择器 + SwapFile).
+// onShowRecvQR: 用户点 "显示接收 QR 码" 时调 (main 起 webview 显示 receiveURL 的二维码).
 // onExit:      用户点退出时调用 (典型用法: server.Shutdown()).
 //              onExit 在 systray.Quit() 之后, 进程返回前执行.
-func Run(shareURL, initialName string, onReceive func(on bool), onPending func(), onConfig func(), onPickFile func(), onExit func()) {
+func Run(shareURL, receiveURL, initialName string, onPending func(), onConfig func(), onPickFile func(), onShowRecvQR func(), onExit func()) {
 	onReady := func() {
 		systray.SetIcon(iconNormalBytes)
 		systray.SetTitle("QuickDrop")
@@ -60,13 +57,12 @@ func Run(shareURL, initialName string, onReceive func(on bool), onPending func()
 
 		mCopy := systray.AddMenuItem("复制扫码链接", "把 "+shareURL+" 写到剪贴板")
 		mPick := systray.AddMenuItem("选文件发送...", "弹原生选择器选一个文件直接发送 (替代右键/拖拽)")
-		mRecv := systray.AddMenuItemCheckbox("接收文件", "开启接收模式, 弹接收 QR 窗", false)
+		mRecvQR := systray.AddMenuItem("显示接收 QR 码", "弹窗显示手机扫码上传的二维码 (需先在设置中开启接收)")
 		mPend := systray.AddMenuItem("待处理 (0)", "查看待接受/拒绝的文件传入")
 		mPend.Hide() // 默认隐藏, 有 pending 时显示
 		mCfg := systray.AddMenuItem("设置", "打开配置中心 (包含设备管理)")
 
 		stateMu.Lock()
-		receiveItem = mRecv
 		pendingItem = mPend
 		stateMu.Unlock()
 
@@ -88,17 +84,9 @@ func Run(shareURL, initialName string, onReceive func(on bool), onPending func()
 						// 跑没问题 - systray 的菜单消息循环在 onReady 已起好.
 						go onPickFile() // 用 goroutine 防对话框阻塞菜单消息派发
 					}
-				case <-mRecv.ClickedCh:
-					if mRecv.Checked() {
-						mRecv.Uncheck()
-						if onReceive != nil {
-							onReceive(false)
-						}
-					} else {
-						mRecv.Check()
-						if onReceive != nil {
-							onReceive(true)
-						}
+				case <-mRecvQR.ClickedCh:
+					if onShowRecvQR != nil {
+						onShowRecvQR()
 					}
 				case <-mPend.ClickedCh:
 					if onPending != nil {
@@ -124,23 +112,6 @@ func Run(shareURL, initialName string, onReceive func(on bool), onPending func()
 // 多次调用安全 (systray 内部幂等).
 func Quit() {
 	systray.Quit()
-}
-
-// SetReceiveChecked 让外部 (server.EnableReceive 回调) 同步菜单勾选状态.
-// 用于 "停止接收" 按钮 / IPC 关接收模式时, 菜单也跟着取消勾.
-//
-// 在 systray.Run 起来之前调是 no-op (没事, 因为初值就是 false).
-func SetReceiveChecked(checked bool) {
-	stateMu.Lock()
-	defer stateMu.Unlock()
-	if receiveItem == nil {
-		return
-	}
-	if checked {
-		receiveItem.Check()
-	} else {
-		receiveItem.Uncheck()
-	}
 }
 
 // UpdateTooltip 给外部 (server SwapFile 回调) 调用, 刷新当前发送的文件名.

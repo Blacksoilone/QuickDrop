@@ -11,10 +11,25 @@
   padding: 0;
 }
 
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   color: #1a1a1a;
   background: #fafafa;
+}
+
+/* 默认禁止拖拽图片 (浏览器默认行为会干扰窗口拖动) */
+img {
+  -webkit-user-drag: none;
+  user-select: none;
 }
 
 a.btn,

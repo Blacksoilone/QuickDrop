@@ -5,15 +5,20 @@
 //   peers  点 "发送到其他设备" 切换. 顶部 ← 返回 + 文件名/大小, 列表占主区
 // 设计原则: 保持 ADR-17 极简 (默认视图不变), PC 列表是显式动作触发,
 // 不混在 QR 视图里.
+//
+// 无边框模式: 整个窗口可拖动 (MiniShell 处理), 右上角浮动关闭按钮.
 import { onMounted, onUnmounted, ref, watch } from "vue";
 import {
   closeWindow,
   fetchInfo,
   fetchPeers,
   sendToPeer,
+  fetchConfig,
   type Peer,
   type ServerInfo,
 } from "../api";
+import Toast from "../components/Toast.vue";
+import MiniShell from "../components/MiniShell.vue";
 
 // 字符串字面量绑定避开 Vite 把 "/qr" 当构建资源解析.
 const qrUrl = "/qr";
@@ -24,10 +29,24 @@ const peers = ref<Peer[]>([]);
 const error = ref<string>("");
 // 状态: idle | sending | sent:<name> | fail:<msg>
 const sendStatus = ref<string>("idle");
+const toastMessage = ref("");
+const showToast = ref(false);
+const borderless = ref(true); // 默认启用无边框
+
+let toastTimer: number | undefined;
 
 let peerTimer: number | undefined;
 
 onMounted(async () => {
+  // 加载配置（检查是否启用无边框）
+  try {
+    const cfg = await fetchConfig();
+    borderless.value = cfg.ui.borderless_windows;
+  } catch {
+    // 失败保持默认值
+  }
+  
+  // 加载文件信息
   try {
     info.value = await fetchInfo();
   } catch (e) {
@@ -91,13 +110,39 @@ async function pickPeer(p: Peer) {
     }, 5000);
   }
 }
+
+function copyLink() {
+  const url = window.location.origin + "/d";
+  navigator.clipboard.writeText(url).then(
+    () => {
+      toastMessage.value = "已复制到剪贴板";
+      showToast.value = true;
+      if (toastTimer !== undefined) window.clearTimeout(toastTimer);
+      toastTimer = window.setTimeout(() => {
+        showToast.value = false;
+      }, 2000);
+    },
+    () => {
+      toastMessage.value = "复制失败";
+      showToast.value = true;
+      if (toastTimer !== undefined) window.clearTimeout(toastTimer);
+      toastTimer = window.setTimeout(() => {
+        showToast.value = false;
+      }, 2000);
+    }
+  );
+}
+
+onUnmounted(() => {
+  stopPeerPolling();
+  if (toastTimer !== undefined) window.clearTimeout(toastTimer);
+});
 </script>
 
 <template>
-  <button class="close" :title="`关闭 (daemon 继续运行)`" @click="closeWindow">×</button>
-
-  <!-- QR 视图 (默认) -->
-  <div v-if="view === 'qr'" class="wrap">
+  <MiniShell :enable-drag="borderless" @close="closeWindow">
+    <!-- QR 视图 (默认) -->
+    <div v-if="view === 'qr'" class="wrap">
     <div class="qr"><img :src="qrUrl" alt="扫码下载" /></div>
     <template v-if="info && info.hasFile">
       <div class="name">{{ info.fileName }}</div>
@@ -110,14 +155,18 @@ async function pickPeer(p: Peer) {
       <div class="size">加载中...</div>
     </template>
 
-    <button
-      v-if="info && info.hasFile"
-      class="switch-btn"
-      @click="view = 'peers'"
-      title="发送给同 WiFi 装了 QuickDrop 的电脑"
-    >
-      发送到其他设备 →
-    </button>
+    <div v-if="info && info.hasFile" class="actions">
+      <button class="copy-btn" @click="copyLink" title="复制下载链接到剪贴板">
+        复制链接
+      </button>
+      <button
+        class="switch-btn"
+        @click="view = 'peers'"
+        title="发送给同 WiFi 装了 QuickDrop 的电脑"
+      >
+        发送到其他设备 →
+      </button>
+    </div>
   </div>
 
   <!-- PC 列表视图 -->
@@ -160,6 +209,9 @@ async function pickPeer(p: Peer) {
       <span v-else-if="sendStatus.startsWith('fail:')">失败: {{ sendStatus.slice(5) }}</span>
     </div>
   </div>
+
+  <Toast :message="toastMessage" :show="showToast" />
+  </MiniShell>
 </template>
 
 <style scoped>
@@ -171,6 +223,13 @@ body,
   height: 100%;
   overflow: hidden;
 }
+
+.page-borderless {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
 .wrap {
   width: 100%;
   height: 100vh;
@@ -178,6 +237,12 @@ body,
   flex-direction: column;
   align-items: center;
   padding: 12px 12px 14px;
+}
+
+/* 无边框模式：wrap 占据剩余空间 */
+.page-borderless .wrap {
+  height: auto;
+  flex: 1;
 }
 
 /* --- QR 视图 --- */
@@ -215,8 +280,29 @@ body,
   color: #d33;
   text-align: center;
 }
-.switch-btn {
+.actions {
   margin-top: auto;
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+.copy-btn {
+  flex: 1;
+  padding: 6px 12px;
+  background: #0066ff;
+  border: 1px solid #0066ff;
+  border-radius: 4px;
+  font-size: 12px;
+  color: #fff;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.copy-btn:hover {
+  background: #0052cc;
+  border-color: #0052cc;
+}
+.switch-btn {
+  flex: 1;
   padding: 6px 12px;
   background: transparent;
   border: 1px solid #cfdcf7;

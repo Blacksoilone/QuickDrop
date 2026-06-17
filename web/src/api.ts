@@ -71,6 +71,7 @@ export async function decidePeer(
 export interface DeviceEntry {
   uuid: string;
   name: string;
+  alias: string;
   trust: "ask" | "trusted" | "blocked";
   firstSeen: number;
   lastSeen: number;
@@ -95,6 +96,32 @@ export async function setDeviceTrust(
   if (!r.ok) {
     const txt = await r.text();
     throw new Error(`device-trust ${r.status}: ${txt}`);
+  }
+}
+
+// 设置设备别名 (空串清除别名, 显示 hostname)
+export async function setDeviceAlias(uuid: string, alias: string): Promise<void> {
+  const r = await fetch("/internal/device-alias", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ uuid, alias }),
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`device-alias ${r.status}: ${txt}`);
+  }
+}
+
+// 删除设备记录
+export async function deleteDevice(uuid: string): Promise<void> {
+  const r = await fetch("/internal/device-delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ uuid }),
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`device-delete ${r.status}: ${txt}`);
   }
 }
 
@@ -186,6 +213,24 @@ export function closeWindow(): void {
   }
 }
 
+// 最小化当前窗口 (无边框窗口专用, webview 注入的 quickdropMinimize)
+export function minimizeWindow(): void {
+  const w = window as unknown as { quickdropMinimize?: () => void };
+  if (typeof w.quickdropMinimize === "function") {
+    w.quickdropMinimize();
+  }
+}
+
+// 启动窗口拖动 (无边框窗口专用)
+// 在 mousedown 事件中调用, WebView2 不支持 -webkit-app-region: drag,
+// 必须通过 Go 调 Win32 SendMessage 实现.
+export function startWindowDrag(): void {
+  const w = window as unknown as { quickdropStartDrag?: () => void };
+  if (typeof w.quickdropStartDrag === "function") {
+    w.quickdropStartDrag();
+  }
+}
+
 // ============================================================
 // 配置中心 (/c) - 与 server.go ConfigStore + internal/config.Config 对齐.
 // 字段命名严格用 snake_case, 跟磁盘 JSON 一致, 直接序列化保存.
@@ -204,10 +249,12 @@ export interface AppConfig {
   };
   receive: {
     max_file_size: number; // 字节, 0 = 不限
+    default_on: boolean;   // 默认接收状态（启动时初值）
   };
   ui: {
     toasts_enabled: boolean;
     reveal_on_done: boolean;
+    borderless_windows: boolean;
   };
   system: {
     autostart: boolean;
@@ -231,5 +278,52 @@ export async function saveConfig(cfg: AppConfig): Promise<void> {
   if (!r.ok) {
     const txt = await r.text();
     throw new Error(`config-save ${r.status}: ${txt}`);
+  }
+}
+
+// 弹出原生 Windows 文件夹选择器, 返回用户选择的路径.
+// 用户取消返回空字符串. 用于配置页"浏览"按钮.
+export async function pickFolder(): Promise<string> {
+  const r = await fetch("/internal/pick-folder", { method: "POST" });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`pick-folder ${r.status}: ${txt}`);
+  }
+  const data = await r.json();
+  return data.path || "";
+}
+
+// ============================================================
+// 系统集成 - 右键菜单 + URL scheme 注册
+// ============================================================
+
+export interface SystemStatus {
+  installed: boolean;
+  installed_path: string;
+  url_scheme_installed: boolean;
+}
+
+// 查询系统注册状态
+export async function fetchSystemStatus(): Promise<SystemStatus> {
+  const r = await fetch("/internal/system-status", { cache: "no-store" });
+  if (!r.ok) throw new Error(`system-status ${r.status}`);
+  return r.json();
+}
+
+// 注册到系统 (注册右键菜单 + URL scheme)
+export async function registerSystem(): Promise<void> {
+  const r = await fetch("/internal/system-register", { method: "POST" });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`system-register ${r.status}: ${txt}`);
+  }
+}
+
+// 取消系统注册 (移除右键菜单 + URL scheme)
+export async function unregisterSystem(): Promise<void> {
+  const r = await fetch("/internal/system-unregister", { method: "POST" });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`system-unregister ${r.status}: ${txt}`);
   }
 }

@@ -42,7 +42,7 @@ async function onSubmit(e: Event) {
       <button class="btn" @click="status = 'idle'">继续上传</button>
     </div>
     <p v-if="status === 'error'" class="err">上传失败: {{ errMsg }}</p>
-    <p class="hint">保存到电脑 ~/Downloads/QuickDrop/</p>
+    <p class="hint">保存到电脑 C:\Users\用户名\Downloads\QuickDrop\</p>
   </div>
 </template>
 

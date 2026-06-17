@@ -112,7 +112,7 @@ func usage() {
   %s recv                 接收模式 (从手机往电脑传)
   %s install              安装右键菜单 "通过 QuickDrop 发送"
   %s uninstall            卸载右键菜单
-  %s status               打印当前 daemon / 右键菜单状态
+  %s status               打印当前程序 / 右键菜单状态
   %s window <url>         内部: webview 子进程入口, 不要手动调
 
 环境变量:
@@ -130,23 +130,36 @@ func main() {
 	// 用法:
 	//   quickdrop window <url>                  默认 264x316 (mini dashboard)
 	//   quickdrop window <url> <width> <height> 自定义尺寸 (config / devices 大窗)
+	//   quickdrop window <url> [width height] [borderless]
+	//   borderless 标志可以出现在任何位置（最后一个参数）.
 	if len(os.Args) >= 2 && os.Args[1] == "window" {
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: quickdrop window <url> [width height]")
+			fmt.Fprintln(os.Stderr, "usage: quickdrop window <url> [width height] [borderless]")
 			os.Exit(1)
 		}
 		setupLogging()
 		w, h := 0, 0
-		if len(os.Args) >= 5 {
-			if n, err := strconv.Atoi(os.Args[3]); err == nil {
-				w = n
-			}
-			if n, err := strconv.Atoi(os.Args[4]); err == nil {
-				h = n
+		borderless := false
+		// 扫描所有参数: 数字 → 尺寸, "borderless" → 无边框标志
+		nums := []int{}
+		for i := 3; i < len(os.Args); i++ {
+			arg := os.Args[i]
+			if arg == "borderless" {
+				borderless = true
+			} else if n, err := strconv.Atoi(arg); err == nil {
+				nums = append(nums, n)
 			}
 		}
-		log.Printf("--- window 子进程 pid=%d, url=%s, size=%dx%d ---", os.Getpid(), os.Args[2], w, h)
-		window.Run(os.Args[2], "QuickDrop", w, h)
+		if len(nums) >= 2 {
+			w = nums[0]
+			h = nums[1]
+		}
+		log.Printf("--- window 子进程 pid=%d, url=%s, size=%dx%d, borderless=%v ---", os.Getpid(), os.Args[2], w, h, borderless)
+		if borderless {
+			window.RunBorderless(os.Args[2], "QuickDrop", w, h)
+		} else {
+			window.Run(os.Args[2], "QuickDrop", w, h)
+		}
 		return
 	}
 
@@ -199,6 +212,12 @@ func main() {
 	// send <path> 或裸路径
 	rawPath, err := parseSendArgs(args)
 	if err != nil {
+		// 无参数时启动纯后台模式（不带文件）
+		if len(args) == 0 {
+			log.Print("无参数启动, 进入后台模式（不带初始文件）")
+			runDaemon("")
+			return
+		}
 		usage()
 		os.Exit(1)
 	}
@@ -231,14 +250,14 @@ func runURLAction(raw string) {
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Post(daemonURL()+"/internal/peer-decide", "application/json", strings.NewReader(body))
 	if err != nil {
-		log.Fatalf("通知 daemon 失败: %v (daemon 没在跑?)", err)
+		log.Fatalf("通知后台服务失败: %v (程序没在运行?)", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		log.Fatalf("daemon 返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(rb)))
+		log.Fatalf("后台服务返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(rb)))
 	}
-	log.Printf("daemon 已确认 %s, 退出", decision)
+	log.Printf("后台服务已确认 %s, 退出", decision)
 }
 
 // parseSendArgs 支持两种形态:
@@ -262,27 +281,27 @@ func runSend(rawPath string) {
 	}
 
 	if probeDaemon() {
-		log.Printf("发现已运行的 daemon, 走客户端模式切换文件: %s", absPath)
+		log.Printf("发现已运行的程序, 走客户端模式切换文件: %s", absPath)
 		if err := notifyDaemonSend(absPath); err != nil {
-			log.Fatalf("通知 daemon 失败: %v", err)
+			log.Fatalf("通知后台服务失败: %v", err)
 		}
-		log.Print("daemon 已切换, 客户端退出")
+		log.Print("后台服务已切换, 客户端退出")
 		return
 	}
-	log.Print("未发现 daemon, 启动新的 daemon (发送文件)")
+	log.Print("未发现运行中的程序, 启动新实例 (发送文件)")
 	runDaemon(absPath)
 }
 
 func runRecv() {
 	if probeDaemon() {
-		log.Print("发现已运行的 daemon, 走客户端模式开启接收")
+		log.Print("发现已运行的程序, 走客户端模式开启接收")
 		if err := notifyDaemonReceive("on"); err != nil {
-			log.Fatalf("通知 daemon 失败: %v", err)
+			log.Fatalf("通知后台服务失败: %v", err)
 		}
-		log.Print("daemon 已开启接收, 客户端退出")
+		log.Print("后台服务已开启接收, 客户端退出")
 		return
 	}
-	log.Print("未发现 daemon, 启动新的 daemon")
+	log.Print("未发现运行中的程序, 启动新实例")
 	// recv 命令明确表达"我要接收", 即使 config.Receive.DefaultOn=false 也强制开启.
 	// 通过环境变量 QUICKDROP_FORCE_RECEIVE 传给 runDaemon (临时方案, 后续可改函数参数).
 	os.Setenv("QUICKDROP_FORCE_RECEIVE", "1")
@@ -460,6 +479,7 @@ func runDaemon(initialPath string) {
 	srv.SetPeerManager(peerMgrAdapter{peer.NewManager()})
 	srv.SetProgressHub(progressHubAdapter{progress.NewHub()})
 	srv.SetConfig(configAdapter{cfgMgr})
+	srv.SetInstaller(installerAdapter{})
 
 	// 如果启动时指定了文件, 动态设置 (不在构造时传)
 	if initialPath != "" {
@@ -542,23 +562,14 @@ func runDaemon(initialPath string) {
 		log.Fatalf("拿不到自身可执行路径: %v", err)
 	}
 	mode := window.ParseMode(os.Getenv(envWindowMode))
-	winMgr := window.NewManager(mode, selfExe)
-	log.Printf("窗口策略: %s (env %s=%s)", mode, envWindowMode, os.Getenv(envWindowMode))
+	borderless := cfgMgr.Get().UI.BorderlessWindows
+	winMgr := window.NewManager(mode, selfExe, borderless)
+	log.Printf("窗口策略: %s (env %s=%s), 无边框: %v", mode, envWindowMode, os.Getenv(envWindowMode), borderless)
 
 	// 文件切换时: 刷托盘 tooltip + 弹发送窗 (按 mode 策略)
 	srv.SetOnSwap(func(name string) {
 		tray.UpdateTooltip(name)
 		winMgr.OpenForFile(srv.HomeURL())
-	})
-
-	// 接收模式切换时: 起/关接收窗 + 同步托盘菜单勾选
-	srv.SetOnReceive(func(on bool) {
-		tray.SetReceiveChecked(on)
-		if on {
-			winMgr.OpenReceiveWindow(srv.ReceiveURL())
-		} else {
-			winMgr.CloseReceiveWindow()
-		}
 	})
 
 	srv.Start()
@@ -571,11 +582,6 @@ func runDaemon(initialPath string) {
 	// quickdrop recv 命令通过 QUICKDROP_FORCE_RECEIVE=1 强制开启 (即使 config 默认关闭).
 	if os.Getenv("QUICKDROP_FORCE_RECEIVE") == "1" {
 		srv.EnableReceive(true)
-	}
-
-	// 托盘 "接收文件" 菜单点击 → 切 server.EnableReceive (会再触发 onReceive 回调)
-	onTrayReceive := func(on bool) {
-		srv.EnableReceive(on)
 	}
 
 	// 托盘 "待处理 (N)" 菜单点击 → 起 pending dashboard 子窗 (单实例).
@@ -615,20 +621,26 @@ func runDaemon(initialPath string) {
 		log.Printf("从托盘选了文件发送: %s", path)
 	}
 
+	// 托盘 "显示接收 QR 码" 菜单点击 → 弹窗显示接收页二维码 (手机扫码上传).
+	// 需要接收模式已开启才有意义, 否则手机扫了也传不上来.
+	onTrayShowRecvQR := func() {
+		winMgr.OpenReceiveWindow(srv.ReceiveURL())
+	}
+
 	// 监听 HTTP server 异常退出 (listener 被外部杀 / 网络栈炸 / 端口被夺):
 	// 触发 systray.Quit() → tray.Run 解阻塞 → onExit 跑标准清理路径.
 	// 比 log.Fatal 强: defer 会被执行, mDNS 下播 + 子窗清理 + 设备表 flush 都不会丢.
 	go func() {
 		<-srv.Done()
 		if err := srv.Err(); err != nil {
-			log.Printf("HTTP server 死了 (%v), 触发 daemon 优雅退出...", err)
+			log.Printf("HTTP server 异常 (%v), 触发程序优雅退出...", err)
 		}
 		// 触发 tray 退出 → tray.Run 解阻塞 → onExit 跑清理.
 		// 用导出的 tray.Quit() 而非直接 import systray, 包边界更整洁.
 		tray.Quit()
 	}()
 
-	tray.Run(srv.MobileURL(), srv.CurrentFileName(), onTrayReceive, onTrayPending, onTrayConfig, onTrayPickFile, func() {
+	tray.Run(srv.MobileURL(), srv.ReceiveURL(), srv.CurrentFileName(), onTrayPending, onTrayConfig, onTrayPickFile, onTrayShowRecvQR, func() {
 		if disc != nil {
 			disc.Close()
 		}
@@ -756,6 +768,14 @@ func (a deviceStoreAdapter) SetTrust(uuid, name, trust string) error {
 	return a.s.SetTrust(uuid, name, t)
 }
 
+func (a deviceStoreAdapter) SetAlias(uuid, alias string) error {
+	return a.s.SetAlias(uuid, alias)
+}
+
+func (a deviceStoreAdapter) Delete(uuid string) error {
+	return a.s.Delete(uuid)
+}
+
 func (a deviceStoreAdapter) All() []server.DeviceEntry {
 	src := a.s.All()
 	out := make([]server.DeviceEntry, len(src))
@@ -763,6 +783,7 @@ func (a deviceStoreAdapter) All() []server.DeviceEntry {
 		out[i] = server.DeviceEntry{
 			UUID:      d.UUID,
 			Name:      d.Name,
+			Alias:     d.Alias,
 			Trust:     string(d.Trust),
 			FirstSeen: d.FirstSeen,
 			LastSeen:  d.LastSeen,
@@ -833,6 +854,15 @@ func (a configAdapter) ToastsEnabled() bool                  { return a.m.Get().
 func (a configAdapter) RevealOnDone() bool                   { return a.m.Get().UI.RevealOnDone }
 func (a configAdapter) MdnsEnabled() bool                    { return a.m.Get().Server.MdnsEnabled }
 func (a configAdapter) Autostart() bool                      { return a.m.Get().System.Autostart }
+
+// installerAdapter 包装 installer 包函数, 适配 server.InstallerInterface.
+// 用空 struct, 因为 installer 包的所有函数都是包级别的.
+type installerAdapter struct{}
+
+func (installerAdapter) Install(exePath string) error  { return installer.Install(exePath) }
+func (installerAdapter) Uninstall() error              { return installer.Uninstall() }
+func (installerAdapter) IsInstalled() (bool, string)   { return installer.IsInstalled() }
+func (installerAdapter) IsURLSchemeInstalled() bool    { return installer.IsURLSchemeInstalled() }
 
 // revealInExplorer Windows: 启 explorer.exe /select,<absPath> 让 Explorer 高亮该文件.
 // 其他平台 noop. 失败只 log, 不致命 (用户至少能去 Downloads 文件夹自己找).

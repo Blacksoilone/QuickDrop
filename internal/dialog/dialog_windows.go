@@ -1,11 +1,11 @@
-// Package dialog 提供原生 Windows 文件选择器, 给托盘 "选文件发送..." 用.
+// Package dialog 提供原生 Windows 文件/文件夹选择器, 给托盘和配置页用.
 //
 // 工程角度选 syscall.LazyDLL 而非 cgo:
 //   - 只调一个 API (GetOpenFileNameW), CGO 是杀鸡用牛刀
 //   - 不引入 mingw 编译依赖到这个包 (整个项目仍需 cgo 给 webview / systray)
 //   - 标准库 syscall + unicode/utf16, 零外部依赖
 //
-// 行为: PickFile 阻塞调用线程直到用户选/取消. 必须在能跑消息循环的 goroutine 调用
+// 行为: PickFile/PickFolder 阻塞调用线程直到用户选/取消. 必须在能跑消息循环的 goroutine 调用
 // (托盘 ClickedCh 处理是 systray 的 goroutine, 可以). 不能在 main goroutine
 // 跟 webview / systray 抢消息.
 package dialog
@@ -99,6 +99,70 @@ func PickFile() (string, error) {
 		}
 	}
 	return string(utf16.Decode(buf)), nil
+}
+
+// PickFolder 弹出原生 Windows 文件夹选择器, 返回用户选择的文件夹路径 (绝对路径).
+// 用户取消返回 ("", nil). 错误罕见 (极端情况才会有).
+func PickFolder() (string, error) {
+	shell32 := syscall.NewLazyDLL("shell32.dll")
+	ole32 := syscall.NewLazyDLL("ole32.dll")
+	
+	shBrowseForFolder := shell32.NewProc("SHBrowseForFolderW")
+	shGetPathFromIDList := shell32.NewProc("SHGetPathFromIDListW")
+	coTaskMemFree := ole32.NewProc("CoTaskMemFree")
+
+	// BROWSEINFO 结构
+	type BROWSEINFO struct {
+		hwndOwner      uintptr
+		pidlRoot       uintptr
+		pszDisplayName *uint16
+		lpszTitle      *uint16
+		ulFlags        uint32
+		lpfn           uintptr
+		lParam         uintptr
+		iImage         int32
+	}
+
+	const (
+		BIF_RETURNONLYFSDIRS   = 0x0001 // 只返回文件系统目录
+		BIF_NEWDIALOGSTYLE     = 0x0040 // 新样式对话框
+		BIF_USENEWUI           = BIF_NEWDIALOGSTYLE
+	)
+
+	displayName := make([]uint16, 260) // MAX_PATH
+	title := utf16.Encode([]rune("选择文件夹"))
+	title = append(title, 0)
+
+	bi := BROWSEINFO{
+		hwndOwner:      0,
+		pidlRoot:       0,
+		pszDisplayName: &displayName[0],
+		lpszTitle:      &title[0],
+		ulFlags:        BIF_RETURNONLYFSDIRS | BIF_USENEWUI,
+		lpfn:           0,
+		lParam:         0,
+		iImage:         0,
+	}
+
+	pidl, _, _ := shBrowseForFolder.Call(uintptr(unsafe.Pointer(&bi)))
+	if pidl == 0 {
+		return "", nil // 用户取消
+	}
+	defer coTaskMemFree.Call(pidl)
+
+	pathBuf := make([]uint16, 260)
+	ret, _, _ := shGetPathFromIDList.Call(pidl, uintptr(unsafe.Pointer(&pathBuf[0])))
+	if ret == 0 {
+		return "", nil
+	}
+
+	// 找 \0 终止符截断
+	for i, c := range pathBuf {
+		if c == 0 {
+			return string(utf16.Decode(pathBuf[:i])), nil
+		}
+	}
+	return string(utf16.Decode(pathBuf)), nil
 }
 
 // utf16Z helper: 把字符串转成 UTF-16 内存表示 + 在末尾追加 \0.

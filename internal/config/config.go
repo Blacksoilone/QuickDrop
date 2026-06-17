@@ -88,6 +88,9 @@ type UIConfig struct {
 	ToastsEnabled bool `json:"toasts_enabled"`
 	// RevealOnDone 接收完文件自动 Explorer 高亮新文件.
 	RevealOnDone bool `json:"reveal_on_done"`
+	// BorderlessWindows 使用无边框窗口 (移除系统标题栏, 显示自定义标题栏).
+	// 默认 true. 关闭后恢复传统带标题栏窗口.
+	BorderlessWindows bool `json:"borderless_windows"`
 }
 
 type SystemConfig struct {
@@ -112,8 +115,9 @@ func Default() Config {
 			DefaultOn:   true, // 默认开启接收
 		},
 		UI: UIConfig{
-			ToastsEnabled: true,
-			RevealOnDone:  true,
+			ToastsEnabled:     true,
+			RevealOnDone:      true,
+			BorderlessWindows: true, // 默认启用无边框
 		},
 		System: SystemConfig{
 			Autostart: false,

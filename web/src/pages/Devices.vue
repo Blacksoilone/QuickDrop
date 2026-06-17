@@ -6,7 +6,7 @@ import DevicePanel from "./DevicePanel.vue";
 </script>
 
 <template>
-  <button class="close" title="关闭窗口 (daemon 继续运行)" @click="closeWindow">×</button>
+  <button class="close" title="关闭窗口 (后台服务继续运行)" @click="closeWindow">×</button>
   <div class="wrap">
     <div class="banner">
       设备管理已合并到
