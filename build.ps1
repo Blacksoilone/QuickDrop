@@ -9,7 +9,7 @@
 # 输出: D:\go_workspace\QuickDrop\quickdrop.exe
 #
 # 工作流:
-#   1. (web/) npm run build → web/dist/{index,d,r,u}.html + assets/*
+#   1. (web/) npm run build → web/dist/{index,d,r,u,p,c,v}.html + assets/*
 #   2. 复制 web/dist/ → cmd/quickdrop/web/ (go:embed 不允许 ../)
 #   3. go build → quickdrop.exe (含 embed 的 Vue 产物)
 

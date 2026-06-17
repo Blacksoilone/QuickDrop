@@ -26,23 +26,23 @@ cmd/quickdrop/main.go         入口,window/recv/send/install/uninstall/status �
                               + //go:embed all:web (Vite 产物嵌入二进制)
 cmd/quickdrop/web/            (build 时由 build.ps1 从 web/dist 复制, 被 embed)
 internal/server/server.go     HTTP server (Start/Shutdown/SwapFile/EnableReceive/SetDist),
-                              路由含 /、/d、/r、/u、/file、/qr、/qr-recv、/upload、/api/info、/assets/*、/internal/*
+                              路由含 /、/d、/r、/u、/p、/c、/file、/qr、/qr-recv、/upload、/api/*、/peer/*、/ws、/assets/*、/internal/*
 internal/qr/qr.go             QR PNG 渲染
-internal/tray/tray.go         systray, 菜单(复制链接/接收文件 checkbox/退出), UpdateTooltip + SetReceiveChecked
+internal/tray/tray.go         systray, 菜单(复制扫码链接/打开接收窗口/发送到其他 PC/设置/退出), UpdateTooltip + pending badge
 internal/tray/icon.ico        托盘图标 16x16 (Windows systray 必须 ICO,不能 PNG)
 internal/window/window.go     webview 子进程实际渲染函数 (runWebview, 含 quickdropClose binding)
-internal/window/manager.go    daemon 持有的子进程管理器 + Mode + recvCmd (发送窗+接收窗独立)
+internal/window/manager.go    daemon 持有的子进程管理器 + Mode + 多类窗口 (发送/接收/待处理/配置)
 internal/installer/registry.go  Windows 右键菜单注册表读写 (HKCU 用户级,无需 UAC)
 internal/installer/msgbox.go    Win32 MessageBoxW 包装 (windowsgui 模式下唯一可视反馈)
 web/                          Vite + Vue3 + TS 前端工程
 web/package.json              依赖 vue/vite/vue-tsc
-web/vite.config.ts            MPA 4 入口 + dev proxy 转 :8443
-web/index.html /d.html /r.html /u.html  4 个页面入口 (对应 server.go 4 路由)
+web/vite.config.ts            MPA 7 入口 + dev proxy 转 :8443
+web/index.html /d.html /r.html /u.html /p.html /c.html /v.html  页面入口 (/v 为旧设备管理薄壳)
 web/src/pages/Dashboard.vue   电脑端发送窗 (拉 /api/info, 渲 QR + 名 + 大小 + 关闭)
 web/src/pages/Download.vue    手机端发送目标页 (文件图标 + 信息 + 下载)
 web/src/pages/Receive.vue     电脑端接收窗 (QR + 提示 + 停止接收)
 web/src/pages/Upload.vue      手机端上传表单
-web/src/api.ts                fetchInfo / stopReceiving / closeWindow 类型安全
+web/src/api.ts                fetchInfo / peers / devices / config / system / progress API 类型安全
 web/src/style.css             全局基础样式 (色彩/字体/.btn/暗色模式)
 build.ps1                     一键构建脚本 (Vue build → 复制 → Go build)
 test/prepare-fixtures.ps1     生成 500MB big.bin + 你好世界.png 验收固件
@@ -61,7 +61,7 @@ TEST.md                       Phase 1 验收清单 (手动 + 自动)
 **前端开发**:
 ```powershell
 cd web
-npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 8443 daemon
+npm run dev    # http://localhost:5173, /api+/internal+/peer+/ws+/qr+/file+/upload 自动 proxy 到 8443 daemon
 ```
 
 ## 3. 已完成
@@ -88,8 +88,8 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
   - 路由语义自动验证:`/`无上传无下载、`/d`无 QR 有下载、`/upload POST`默认 404、`/qr`仍 200 PNG
   - 像素采样验证窗口外观:QR 完整(851 黑像素)、无右侧滚动条(右边纯白)、尺寸贴合(279×353 含标题栏)
 - [x] **任务 2.13 接收模式 + 安全分离** (ADR-17):
-  - `quickdrop recv` 新 CLI 子命令 / 托盘 "接收文件" checkbox 菜单项 (二者通过 IPC `/internal/receive on|off` 统一切换)
-  - `server.EnableReceive(bool)` + `SetOnReceive` 回调: tray 菜单同步勾选 + winMgr 起/关接收窗
+  - `quickdrop recv` 新 CLI 子命令 / 托盘接收入口 (二者通过 IPC `/internal/receive on|off` 统一切换)
+  - `server.EnableReceive(bool)`: 切换 receiveMode 门禁, 接收窗口由 window manager 独立管理
   - 新路由: `/r` 接收 dashboard (QR + 提示 + 停止接收键) + `/qr-recv` 编码上传 URL + `/u` 上传表单 (受 receiveMode 门禁)
   - daemon 支持纯接收模式启动 (无文件): 发送类路由全 404 防泄露
   - 发送和接收可共存: send 模式 daemon 也可 IPC `recv on` 同时开两种模式
@@ -105,15 +105,15 @@ npm run dev    # http://localhost:5173, /api+/qr+/file+/upload 自动 proxy 到 
   - test-install.ps1 18 checks ALL PASS (写入/幂等/状态/卸载/卸载幂等/路径含引号)
   - **真正的核心交互**: 右键文件 → "通过 QuickDrop 发送" → 1 秒内弹 QR 窗
 - [x] **任务 2.7 Vue 工程化**:
-  - `web/` 完整 Vite + Vue3 + TypeScript MPA 工程, 4 个独立入口对应 4 路由
-  - `web/src/pages/{Dashboard,Download,Receive,Upload}.vue` 替代原 HTML 模板字符串
-  - `web/src/api.ts` 类型安全包装 fetchInfo / stopReceiving / closeWindow
-  - server 新增 `/api/info` JSON API + `/assets/*` 静态资源 (来自嵌入的 dist)
+  - `web/` 完整 Vite + Vue3 + TypeScript MPA 工程, 7 个独立入口对应当前页面路由
+  - `web/src/pages/{Dashboard,Download,Receive,Upload,Pending,Config,Devices}.vue` 替代/承载各页面入口
+  - `web/src/api.ts` 类型安全包装 fetchInfo / stopReceiving / closeWindow / peers / devices / config / system / progress
+  - server 提供 `/api/*` JSON API + `/ws` 进度 + `/assets/*` 静态资源 (来自嵌入的 dist)
   - `cmd/quickdrop` 用 `//go:embed all:web` 嵌入 Vite 产物 (build.ps1 自动从 web/dist 复制过去)
   - build.ps1 增加 Vue build 前置 (-SkipWeb 可跳过), npm 镜像换 npmmirror
   - 删除旧 internal/server/templates.go (268 行) 与所有 fmt.Fprintf HTML 拼接逻辑
   - 5 个回归测试脚本全 PASS (test-routes 改测 Vue 骨架 + /api/info; test-daemon-switch 改测 /api/info)
-  - **开发体验飞跃**: `cd web && npm run dev` 起 5173, /api+/qr+/file+/upload 自动 proxy 到 8443 daemon, 热重载
+  - **开发体验飞跃**: `cd web && npm run dev` 起 5173, /api+/internal+/peer+/ws+/qr+/file+/upload 自动 proxy 到 8443 daemon, 热重载
 - [x] **任务 2.5a mDNS 广播 + 发现** (ADR-19, ADR-20):
   - 新包 `internal/identity`: 持久化 UUID (~/.quickdrop/device-id) + 显示名 (env QUICKDROP_DEVICE_NAME / 主机名)
   - 新包 `internal/discovery`: 基于 grandcat/zeroconf, 服务名 `_quickdrop._tcp.local`, TXT 含 name/uuid/version
