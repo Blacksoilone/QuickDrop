@@ -8,7 +8,7 @@
 //   trusted 信任. 收到 incoming → 直接 accept + Pull, 同时弹纯通知 toast 告知
 //   blocked 黑名单. 收到 incoming → 直接 reject, 不弹 toast, 不留 pending
 //
-// 用户可在设备管理页 (/v) 任意时刻撤回信任或解除黑名单.
+// 用户可在配置中心设备页 (/c#devices) 任意时刻撤回信任或解除黑名单.
 package devices
 
 import (
@@ -43,7 +43,8 @@ func (t Trust) IsValid() bool {
 // Device 持久化的一条设备记录.
 type Device struct {
 	UUID      string `json:"uuid"`
-	Name      string `json:"name"`      // 最近一次 mDNS 看到的显示名
+	Name      string `json:"name"`      // 最近一次 mDNS 看到的显示名 (hostname)
+	Alias     string `json:"alias"`     // 用户自定义别名 (空串则显示 Name)
 	Trust     Trust  `json:"trust"`
 	FirstSeen int64  `json:"firstSeen"` // Unix 秒
 	LastSeen  int64  `json:"lastSeen"`  // Unix 秒
@@ -144,7 +145,7 @@ func (s *Store) UpsertSeen(uuid, name string) error {
 	return s.flush()
 }
 
-// SetTrust 直接设 trust. 用户在 /v 管理页操作走这.
+// SetTrust 直接设 trust. 用户在 /c#devices 设备页操作走这.
 // 设备不存在会创建一条 (lastSeen=0, 还没见过的设备也能预先信任/拉黑).
 func (s *Store) SetTrust(uuid, name string, t Trust) error {
 	if uuid == "" {
@@ -167,6 +168,35 @@ func (s *Store) SetTrust(uuid, name string, t Trust) error {
 	if name != "" {
 		d.Name = name
 	}
+	s.mu.Unlock()
+	return s.flush()
+}
+
+// SetAlias 设置设备别名 (用户自定义友好名称). 空串清除别名.
+// 设备不存在返回错误.
+func (s *Store) SetAlias(uuid, alias string) error {
+	if uuid == "" {
+		return errors.New("uuid 不能为空")
+	}
+	s.mu.Lock()
+	d, ok := s.devices[uuid]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("设备 %s 不存在", uuid)
+	}
+	d.Alias = alias
+	s.mu.Unlock()
+	return s.flush()
+}
+
+// Delete 删除设备记录. 设备不存在视为成功 (幂等).
+// 注意: 删除后设备再次连接会以默认 trust=ask 状态重新出现.
+func (s *Store) Delete(uuid string) error {
+	if uuid == "" {
+		return errors.New("uuid 不能为空")
+	}
+	s.mu.Lock()
+	delete(s.devices, uuid)
 	s.mu.Unlock()
 	return s.flush()
 }

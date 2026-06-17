@@ -1,7 +1,9 @@
-// Package server hosts the QuickDrop HTTP routes
-// (/, /d, /r, /u, /file, /qr, /qr-recv, /upload) plus internal IPC routes
-// (/internal/health, /internal/send, /internal/receive) and the JSON API
-// (/api/info) for the Vue 前端 (2.7).
+// Package server hosts the QuickDrop HTTP routes:
+//   - 页面: /, /d, /r, /u, /p, /c
+//   - 文件/QR: /file, /qr, /qr-recv, /upload
+//   - JSON API: /api/info, /api/peers, /api/pending, /api/devices, /api/config
+//   - PC↔PC: /peer/incoming, /peer/file
+//   - 本机 IPC: /internal/*
 //
 // ADR-17 路由职责:
 //   /        电脑端发送 dashboard (Vue 渲染, GET 拉 /api/info), 只渲 QR + 文件名/大小 + 关闭键
@@ -12,7 +14,9 @@
 //   /u       手机端上传表单 (Vue, 受 receiveMode 门禁)
 //   /qr-recv PNG QR, 编码 baseURL + /u (接收模式)
 //   /upload  实际接收上传, 默认 404 (ADR-17 安全约束), 由 EnableReceive(true) 开启
-//   /api/info JSON 服务状态, Vue 前端拉取
+//   /p       PC↔PC 待处理 incoming 列表页 (Vue)
+//   /c       配置中心 (Vue, 含设备管理)
+//   /api/*   JSON 服务状态 / peers / pending / devices / config
 //   /assets/* embed.FS 静态资源 (Vue chunk + CSS)
 //
 // 单进程 daemon 模式: 第一次 quickdrop send X 起 daemon, 后续 send Y 走 IPC
@@ -39,6 +43,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"quickdrop/internal/dialog"
 	"quickdrop/internal/qr"
 	"quickdrop/internal/receive"
 	"quickdrop/internal/transfer"
@@ -91,13 +96,16 @@ type Server struct {
 	// nil 时全用硬编码默认值 (向后兼容).
 	cfg ConfigStore
 
+	// installer 系统注册管理 (右键菜单 + URL scheme). 由 SetInstaller 注入.
+	// nil 时 /internal/system-* 路由返回错误.
+	installer InstallerInterface
+
 	// myIdentity 本机身份 (UUID + 显示名), 给 /peer/incoming 时填 from 字段用.
 	// 由 SetIdentity 注入.
 	myUUID string
 	myName string
 
 	onSwap          func(newName string)                                            // 文件被 SwapFile 切换后回调 (tray tooltip 用)
-	onReceive       func(on bool)                                                   // 接收模式切换后回调 (main 起/关 receive webview)
 	onPeerIncoming  func(fromName, fileName string, fileSize int64, token string)   // peer incoming ask 时弹 toast (按钮)
 	onPeerAccepted  func(fromName, fileName string, fileSize int64)                 // peer incoming trusted 自动接受时弹纯通知
 	onPeerSent      func(toName, fileName string, fileSize int64)                   // 我作为 sender, 对端 Pull 完成时
@@ -150,18 +158,30 @@ type PendingEntry struct {
 	Trust    string `json:"trust"`    // 该发送方设备当前 trust (ask/trusted/blocked), 给 Vue 显示徽章用
 }
 
-// DeviceStore 信任表接口. 实现是 internal/devices.Store, 抽 interface 避免循环 import.
+// InstallerInterface 注入接口, server 通过它管理系统注册 (右键菜单 + URL scheme).
+// 实际实现是 internal/installer 包.
+type InstallerInterface interface {
+	Install(exePath string) error
+	Uninstall() error
+	IsInstalled() (bool, string)
+	IsURLSchemeInstalled() bool
+}
+
+// DeviceStore 注入接口. 实现在 internal/devices.Store, 拆 interface 避免循环 import.
 type DeviceStore interface {
 	TrustOf(uuid string) string                       // 返 "ask" / "trusted" / "blocked", 未知设备返 "ask"
-	UpsertSeen(uuid, name string) error               // 收到 incoming 时更新最近见到
-	SetTrust(uuid, name, trust string) error          // 用户操作 /v 管理页或 pending 决策时调
-	All() []DeviceEntry                               // 列所有已知设备
+	UpsertSeen(uuid, name string) error               // 收到 incoming 时上次出现更新
+	SetTrust(uuid, name, trust string) error          // 用户点击 /c#devices 设备页或 pending 决策时调
+	SetAlias(uuid, alias string) error                // 用户设置设备别名
+	Delete(uuid string) error                          // 删除设备记录
+	All() []DeviceEntry                               // 列举所有已知设备
 }
 
 // DeviceEntry 给 /api/devices 用的快照.
 type DeviceEntry struct {
 	UUID      string `json:"uuid"`
 	Name      string `json:"name"`
+	Alias     string `json:"alias"`
 	Trust     string `json:"trust"`
 	FirstSeen int64  `json:"firstSeen"`
 	LastSeen  int64  `json:"lastSeen"`
@@ -280,8 +300,7 @@ func (s *Server) HasFile() bool {
 }
 
 // EnableReceive 开/关接收模式 (是否真正接受 /upload 上传). ADR-17 安全约束.
-// 触发 onReceive 回调让 main 起/关 receive webview.
-// 状态未变化时无副作用 (不重复触发回调, 不重复 log).
+// 状态未变化时无副作用 (不重复 log).
 func (s *Server) EnableReceive(on bool) {
 	prev := s.receive.IsEnabled()
 	s.receive.Enable(on)
@@ -289,9 +308,6 @@ func (s *Server) EnableReceive(on bool) {
 		return // 状态未变, 无需通知
 	}
 	log.Printf("接收模式: %v → %v", prev, on)
-	if s.onReceive != nil {
-		s.onReceive(on)
-	}
 }
 
 // IsReceiving 当前是否在接收模式.
@@ -310,12 +326,6 @@ func (s *Server) CurrentFileName() string {
 // 必须在 Start 之前调用.
 func (s *Server) SetOnSwap(fn func(newName string)) {
 	s.onSwap = fn
-}
-
-// SetOnReceive 注册接收模式切换回调, 用于 main 起/关 receive webview.
-// 必须在 Start 之前调用.
-func (s *Server) SetOnReceive(fn func(on bool)) {
-	s.onReceive = fn
 }
 
 // SetDist 注入 Vite 构建产物 fs (含 index.html / d.html / r.html / u.html / assets/*).
@@ -407,6 +417,11 @@ func (s *Server) SetConfig(c ConfigStore) {
 	s.cfg = c
 }
 
+// SetInstaller 注入 installer (系统注册管理).
+func (s *Server) SetInstaller(i InstallerInterface) {
+	s.installer = i
+}
+
 // emitPendingChange 在 peer manager 状态可能变化后调用.
 // 拉最新 pending count 传给回调. 由 handlePeerIncoming / handleInternalPeerDecide 等触发.
 func (s *Server) emitPendingChange() {
@@ -473,7 +488,13 @@ func (s *Server) Start() {
 	mux.HandleFunc("/internal/peer-send", requireLocal(s.handleInternalPeerSend))
 	mux.HandleFunc("/internal/peer-decide", requireLocal(s.handleInternalPeerDecide))
 	mux.HandleFunc("/internal/device-trust", requireLocal(s.handleInternalDeviceTrust))
+	mux.HandleFunc("/internal/device-alias", requireLocal(s.handleInternalDeviceAlias))
+	mux.HandleFunc("/internal/device-delete", requireLocal(s.handleInternalDeviceDelete))
 	mux.HandleFunc("/internal/config-save", requireLocal(s.handleInternalConfigSave))
+	mux.HandleFunc("/internal/pick-folder", requireLocal(s.handleInternalPickFolder))
+	mux.HandleFunc("/internal/system-register", requireLocal(s.handleInternalSystemRegister))
+	mux.HandleFunc("/internal/system-unregister", requireLocal(s.handleInternalSystemUnregister))
+	mux.HandleFunc("/internal/system-status", requireLocal(s.handleInternalSystemStatus))
 	// WebSocket: 推实时传输进度给 Vue. 任意 LAN 都能连 (只读, 不暴露敏感信息).
 	mux.HandleFunc("/ws", s.handleWS)
 	// 静态资源 (Vue chunks / CSS)
@@ -711,7 +732,7 @@ func (s *Server) handleAPIPending(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(list)
 }
 
-// handleAPIDevices /api/devices : Vue 设备管理页 (/v) 拉所有已知设备.
+// handleAPIDevices /api/devices : Vue 配置中心设备页 (/c#devices) 拉所有已知设备.
 func (s *Server) handleAPIDevices(w http.ResponseWriter, r *http.Request) {
 	list := []DeviceEntry{}
 	if s.deviceStore != nil {
@@ -757,6 +778,88 @@ func (s *Server) handleInternalConfigSave(w http.ResponseWriter, r *http.Request
 	}
 	log.Print("config 已保存 + 热应用")
 	resp200JSON(w, map[string]string{"ok": "saved"})
+}
+
+// handleInternalPickFolder POST /internal/pick-folder : Vue 配置页选择文件夹按钮.
+// 弹出原生 Windows 文件夹选择器, 返回用户选择的路径.
+// 仅 127.0.0.1.
+func (s *Server) handleInternalPickFolder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "需要 POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 这个调用会阻塞直到用户选择或取消, 但没关系 - HTTP handler 跑在独立 goroutine.
+	path, err := s.pickFolder()
+	if err != nil {
+		http.Error(w, "打开文件夹选择器失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// 用户取消返回空路径
+	resp200JSON(w, map[string]string{"path": path})
+}
+
+// handleInternalSystemRegister POST /internal/system-register : 注册到 Windows 系统 (右键菜单 + URL scheme).
+// 前端配置页 "注册到系统" 按钮调用.
+func (s *Server) handleInternalSystemRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "需要 POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		http.Error(w, "无法获取可执行文件路径: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.installer.Install(exePath); err != nil {
+		http.Error(w, "注册失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp200JSON(w, map[string]bool{"ok": true})
+}
+
+// handleInternalSystemUnregister POST /internal/system-unregister : 取消注册 (移除右键菜单 + URL scheme).
+// 前端配置页 "取消注册" 按钮调用.
+func (s *Server) handleInternalSystemUnregister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "需要 POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := s.installer.Uninstall(); err != nil {
+		http.Error(w, "取消注册失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp200JSON(w, map[string]bool{"ok": true})
+}
+
+// handleInternalSystemStatus GET /internal/system-status : 查询系统注册状态.
+// 前端配置页用来显示当前状态.
+func (s *Server) handleInternalSystemStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "需要 GET", http.StatusMethodNotAllowed)
+		return
+	}
+
+	installed, installedPath := s.installer.IsInstalled()
+	urlSchemeInstalled := s.installer.IsURLSchemeInstalled()
+
+	resp200JSON(w, map[string]any{
+		"installed":             installed,
+		"installed_path":        installedPath,
+		"url_scheme_installed":  urlSchemeInstalled,
+	})
+}
+
+// pickFolder 包装 dialog.PickFolder, 返回用户选择的文件夹路径.
+// 这个方法会阻塞直到用户选择或取消, 但 HTTP handler 跑在独立 goroutine 没问题.
+func (s *Server) pickFolder() (string, error) {
+	return dialog.PickFolder()
 }
 
 // handleWS /ws : 给 Vue 推实时传输进度. 任意 LAN 都能连 (内容只读, 不含敏感信息).
@@ -1097,7 +1200,7 @@ func (s *Server) handleInternalPeerDecide(w http.ResponseWriter, r *http.Request
 	resp200JSON(w, map[string]string{"decision": "accepted", "pulling": "started"})
 }
 
-// handleInternalDeviceTrust POST /internal/device-trust : 设备管理页 (Vue /v) 用.
+// handleInternalDeviceTrust POST /internal/device-trust : 配置中心设备页 (Vue /c#devices) 用.
 // body = JSON { uuid, name?, trust }
 // 设备不存在会新建 (允许预先信任/拉黑还没见过的设备).
 // 仅 127.0.0.1.
@@ -1129,6 +1232,67 @@ func (s *Server) handleInternalDeviceTrust(w http.ResponseWriter, r *http.Reques
 	}
 	log.Printf("设备 trust 已更新: %s (%s) → %s", body.Name, body.UUID[:8], body.Trust)
 	resp200JSON(w, map[string]string{"uuid": body.UUID, "trust": body.Trust})
+}
+
+// handleInternalDeviceAlias POST /internal/device-alias : 设置设备别名.
+// body = JSON { uuid, alias }. 仅 127.0.0.1.
+func (s *Server) handleInternalDeviceAlias(w http.ResponseWriter, r *http.Request) {
+	if s.deviceStore == nil {
+		http.Error(w, "device store 未注入", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "需要 POST", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		UUID  string `json:"uuid"`
+		Alias string `json:"alias"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "解析 body 失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.UUID == "" {
+		http.Error(w, "uuid 不能为空", http.StatusBadRequest)
+		return
+	}
+	if err := s.deviceStore.SetAlias(body.UUID, body.Alias); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	log.Printf("设备 alias 已更新: %s → %q", body.UUID[:8], body.Alias)
+	resp200JSON(w, map[string]string{"uuid": body.UUID, "alias": body.Alias})
+}
+
+// handleInternalDeviceDelete POST /internal/device-delete : 删除设备记录.
+// body = JSON { uuid }. 仅 127.0.0.1.
+func (s *Server) handleInternalDeviceDelete(w http.ResponseWriter, r *http.Request) {
+	if s.deviceStore == nil {
+		http.Error(w, "device store 未注入", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "需要 POST", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		UUID string `json:"uuid"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "解析 body 失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.UUID == "" {
+		http.Error(w, "uuid 不能为空", http.StatusBadRequest)
+		return
+	}
+	if err := s.deviceStore.Delete(body.UUID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	log.Printf("设备已删除: %s", body.UUID[:8])
+	resp200JSON(w, map[string]string{"uuid": body.UUID, "deleted": "true"})
 }
 
 // pullPeerFile 主动 GET 发送方的 /peer/file?token=xxx, 流式写到 Downloads/QuickDrop/.
@@ -1230,31 +1394,46 @@ func (s *Server) handleInternalSend(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("switched"))
 }
 
-// handleInternalReceive: POST /internal/receive body=on|off
-// 开/关接收模式. 用于 `quickdrop recv` 客户端模式让 daemon 切到接收状态.
+// handleInternalReceive: POST /internal/receive
+// 开/关接收模式. 支持两种格式:
+//   1. JSON body: {"enable": true/false} (配置中心 Vue 用)
+//   2. 文本 body: "on" 或 "off" (`quickdrop recv` 客户端模式用)
 // 仅 127.0.0.1 可访问.
 func (s *Server) handleInternalReceive(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "需要 POST", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 32))
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1024))
 	if err != nil {
 		http.Error(w, "读 body 失败: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	cmd := strings.TrimSpace(string(body))
-	switch cmd {
-	case "on":
-		s.EnableReceive(true)
-	case "off":
-		s.EnableReceive(false)
-	default:
-		http.Error(w, `body 必须是 "on" 或 "off"`, http.StatusBadRequest)
-		return
+
+	var enable bool
+	// 尝试 JSON 格式
+	var jsonBody struct {
+		Enable bool `json:"enable"`
 	}
+	if err := json.Unmarshal(body, &jsonBody); err == nil {
+		enable = jsonBody.Enable
+	} else {
+		// 回退到文本格式 "on"/"off"
+		cmd := strings.TrimSpace(string(body))
+		switch cmd {
+		case "on":
+			enable = true
+		case "off":
+			enable = false
+		default:
+			http.Error(w, `body 必须是 JSON {"enable": true/false} 或文本 "on"/"off"`, http.StatusBadRequest)
+			return
+		}
+	}
+
+	s.EnableReceive(enable)
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(cmd))
+	json.NewEncoder(w).Encode(map[string]bool{"enabled": enable})
 }
 
 // requireLocal 拒绝非 127.0.0.1 的访问, 直接 404 (不暴露存在性).

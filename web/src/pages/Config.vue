@@ -4,14 +4,32 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   closeWindow,
+  startWindowDrag,
+  fetchInfo,
   fetchConfig,
   saveConfig,
+  fetchSystemStatus,
+  registerSystem,
+  unregisterSystem,
   type AppConfig,
   type ConflictPolicy,
+  type SystemStatus,
 } from "../api";
 import DevicePanel from "./DevicePanel.vue";
+import {
+  Star,
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  Bell,
+  Wifi,
+  Monitor,
+  Settings as SettingsIcon,
+  Info,
+  type LucideIcon,
+} from "lucide-vue-next";
 
 type SectionKey =
+  | "common"
   | "receive"
   | "send"
   | "notify"
@@ -23,30 +41,39 @@ type SectionKey =
 interface Section {
   key: SectionKey;
   label: string;
-  icon: string; // unicode 字符
+  icon: LucideIcon;
 }
 
 const SECTIONS: Section[] = [
-  { key: "receive", label: "接收", icon: "↓" },
-  { key: "send", label: "发送", icon: "↑" },
-  { key: "notify", label: "通知", icon: "♪" },
-  { key: "network", label: "网络", icon: "◉" },
-  { key: "devices", label: "设备", icon: "▤" },
-  { key: "system", label: "系统", icon: "⚙" },
-  { key: "about", label: "关于", icon: "?" },
+  { key: "common", label: "常用", icon: Star },
+  { key: "receive", label: "接收", icon: ArrowDownToLine },
+  { key: "send", label: "发送", icon: ArrowUpFromLine },
+  { key: "notify", label: "通知", icon: Bell },
+  { key: "network", label: "网络", icon: Wifi },
+  { key: "devices", label: "设备", icon: Monitor },
+  { key: "system", label: "系统", icon: SettingsIcon },
+  { key: "about", label: "关于", icon: Info },
 ];
 
-const VERSION = "v0.11.0";
-const CONFIG_PATH = "~/.quickdrop/config.json";
+const VERSION = "v0.12.x";
+const CONFIG_PATH = "%USERPROFILE%\\.quickdrop\\config.json";
 const MB = 1024 * 1024;
 
-const active = ref<SectionKey>("receive");
-// 上次从 daemon 拉到的原始 cfg (JSON 序列化串, 用来比 dirty)
+const active = ref<SectionKey>("common");
+// 上次从后台服务拉到的原始 cfg (JSON 序列化串, 用来比 dirty)
 const baseline = ref<string>("");
 // 工作中的可编辑副本
 const cfg = ref<AppConfig | null>(null);
 // max_file_size 在 UI 上以 MB 显示, 单独的双向绑定字段
 const maxFileSizeMB = ref<number>(0);
+// 运行时接收状态 (不保存到 config, 独立管理)
+const receiving = ref<boolean>(false);
+const receivingError = ref<string>("");
+
+// 系统集成状态
+const systemStatus = ref<SystemStatus | null>(null);
+const systemBusy = ref<boolean>(false);
+const systemMessage = ref<string>("");
 
 const loadError = ref<string>("");
 const saveError = ref<string>("");
@@ -88,6 +115,7 @@ onMounted(async () => {
   active.value = parseHash();
   window.addEventListener("hashchange", onHashChange);
   await reload();
+  await loadSystemStatus();
 });
 
 onUnmounted(() => {
@@ -103,8 +131,69 @@ async function reload() {
     cfg.value = c;
     baseline.value = JSON.stringify(c);
     maxFileSizeMB.value = Math.round(c.receive.max_file_size / MB);
+    const info = await fetchInfo();
+    receiving.value = info.receiving;
   } catch (e) {
     loadError.value = String(e);
+  }
+}
+
+async function toggleReceive(on: boolean) {
+  receivingError.value = "";
+  try {
+    const resp = await fetch("/internal/receive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enable: on }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`${resp.status}: ${text}`);
+    }
+    receiving.value = on;
+  } catch (e) {
+    receivingError.value = String(e);
+    // 回滚 UI
+    receiving.value = !on;
+  }
+}
+
+async function loadSystemStatus() {
+  try {
+    systemStatus.value = await fetchSystemStatus();
+  } catch (e) {
+    systemMessage.value = "无法获取系统状态: " + String(e);
+  }
+}
+
+async function handleRegister() {
+  systemBusy.value = true;
+  systemMessage.value = "";
+  try {
+    await registerSystem();
+    systemMessage.value = "已成功注册到系统";
+    await loadSystemStatus();
+  } catch (e) {
+    systemMessage.value = "注册失败: " + String(e);
+  } finally {
+    systemBusy.value = false;
+  }
+}
+
+async function handleUnregister() {
+  if (!confirm("确定要取消注册吗？\n\n这将移除：\n• 右键菜单 \"通过 QuickDrop 发送\"\n• quickdrop:// URL 处理")) {
+    return;
+  }
+  systemBusy.value = true;
+  systemMessage.value = "";
+  try {
+    await unregisterSystem();
+    systemMessage.value = "已取消注册";
+    await loadSystemStatus();
+  } catch (e) {
+    systemMessage.value = "取消注册失败: " + String(e);
+  } finally {
+    systemBusy.value = false;
   }
 }
 
@@ -133,19 +222,61 @@ async function save() {
   }
 }
 
+async function browseDownloadDir() {
+  try {
+    const { pickFolder } = await import("../api");
+    const path = await pickFolder();
+    if (path && cfg.value) {
+      cfg.value.download.dir = path;
+    }
+  } catch (e) {
+    console.error("选择文件夹失败:", e);
+  }
+}
+
+function handleTitlebarDrag(e: MouseEvent) {
+  // 只响应左键, 排除按钮区域
+  if (e.button !== 0) return;
+  const target = e.target as HTMLElement;
+  if (target.closest("button, a, input, select, textarea")) return;
+  startWindowDrag();
+}
+
 function setConflict(p: ConflictPolicy) {
   if (cfg.value) cfg.value.download.conflict = p;
+}
+
+async function confirmDefaultOn(val: boolean) {
+  if (!cfg.value) return;
+
+  const msg = val
+    ? "⚠️ 启用默认接收后，程序每次启动都会自动接受文件上传。\n\n" +
+      "这可能带来安全风险（未知设备可上传）。\n\n" +
+      "确定修改吗？"
+    : "关闭默认接收后，程序启动时不会自动接受上传。\n\n" +
+      "需要时可在「常用设置」手动开启。\n\n" +
+      "确定修改吗？";
+
+  if (!confirm(msg)) {
+    // 用户取消，回滚 UI（Vue 已经改了 checked，需要下一帧恢复）
+    await new Promise(resolve => setTimeout(resolve, 0));
+    cfg.value.receive.default_on = !val;
+    return;
+  }
+
+  // 用户确认，保持修改（触发 dirty 检测）
+  cfg.value.receive.default_on = val;
 }
 </script>
 
 <template>
   <div class="shell">
-    <header class="titlebar">
+    <header class="titlebar" @mousedown="handleTitlebarDrag">
       <div class="title">
         <span class="dot" />
         QuickDrop 设置
       </div>
-      <button class="close" title="关闭窗口 (daemon 继续运行)" @click="closeWindow">
+      <button class="close" title="关闭窗口 (后台服务继续运行)" @click="closeWindow">
         ×
       </button>
     </header>
@@ -180,13 +311,51 @@ function setConflict(p: ConflictPolicy) {
           :class="['nav-item', { active: active === s.key }]"
           @click="selectSection(s.key)"
         >
-          <span class="nav-icon">{{ s.icon }}</span>
+          <span class="nav-icon"><component :is="s.icon" :size="16" /></span>
           <span class="nav-label">{{ s.label }}</span>
         </button>
       </aside>
 
       <main class="panel">
         <template v-if="cfg">
+          <!-- 常用设置 -->
+          <section v-if="active === 'common'" class="card">
+            <h2>常用设置</h2>
+
+            <!-- 接收开关 (运行时状态) -->
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">接收文件</div>
+                <div class="row-desc">
+                  控制是否接受手机/PC上传。关闭后无法接收文件。<br />
+                  <small class="hint">重启后恢复到"默认接收状态"（见接收设置页）</small>
+                </div>
+              </div>
+              <div class="row-control">
+                <label class="switch">
+                  <input
+                    type="checkbox"
+                    :checked="receiving"
+                    @change="toggleReceive(($event.target as HTMLInputElement).checked)"
+                  />
+                  <span class="slider"></span>
+                </label>
+                <span :class="['status-text', receiving ? 'on' : 'off']">
+                  {{ receiving ? "开启" : "关闭" }}
+                </span>
+              </div>
+            </div>
+
+            <div v-if="receivingError" class="err">{{ receivingError }}</div>
+
+            <div class="section-divider"></div>
+
+            <!-- 提示：其他常用项留待后续补充 -->
+            <div class="hint-block">
+              <small>💡 更多设置项请前往对应的专项设置页</small>
+            </div>
+          </section>
+
           <!-- 接收 -->
           <section v-if="active === 'receive'" class="card">
             <h2>接收</h2>
@@ -200,8 +369,9 @@ function setConflict(p: ConflictPolicy) {
                   v-model="cfg.download.dir"
                   type="text"
                   class="text"
-                  placeholder="留空表示使用默认: ~/Downloads/QuickDrop/"
+                  placeholder="留空表示使用默认: C:\Users\用户名\Downloads\QuickDrop\"
                 />
+                <button class="btn-browse" @click="browseDownloadDir">浏览...</button>
               </div>
             </div>
             <div class="row">
@@ -264,6 +434,30 @@ function setConflict(p: ConflictPolicy) {
                 <span class="hint-after">0 表示不限制</span>
               </div>
             </div>
+
+            <!-- 默认接收状态 -->
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">默认接收状态</div>
+                <div class="row-desc">
+                  程序启动时是否自动开启接收。<br />
+                  <small class="hint">建议关闭（安全）。需要时可在「常用设置」中手动开启。</small>
+                </div>
+              </div>
+              <div class="row-control">
+                <label class="switch">
+                  <input
+                    type="checkbox"
+                    :checked="cfg.receive.default_on"
+                    @change="confirmDefaultOn(($event.target as HTMLInputElement).checked)"
+                  />
+                  <span class="slider"></span>
+                </label>
+                <span :class="['status-text', cfg.receive.default_on ? 'on' : 'off']">
+                  {{ cfg.receive.default_on ? "启用" : "禁用" }}
+                </span>
+              </div>
+            </div>
           </section>
 
           <!-- 发送 -->
@@ -301,6 +495,18 @@ function setConflict(p: ConflictPolicy) {
                 </label>
               </div>
             </div>
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">无边框窗口</div>
+                <div class="row-desc">使用现代无边框设计（移除系统标题栏）</div>
+              </div>
+              <div class="row-control">
+                <label class="toggle">
+                  <input v-model="cfg.ui.borderless_windows" type="checkbox" />
+                  <span class="track" />
+                </label>
+              </div>
+            </div>
           </section>
 
           <!-- 网络 -->
@@ -309,7 +515,7 @@ function setConflict(p: ConflictPolicy) {
             <div class="row">
               <div class="row-label">
                 <div class="row-title">服务端口</div>
-                <div class="row-desc">daemon HTTP 监听端口</div>
+                <div class="row-desc">HTTP 监听端口</div>
               </div>
               <div class="row-control">
                 <input
@@ -319,7 +525,7 @@ function setConflict(p: ConflictPolicy) {
                   max="65535"
                   class="num"
                 />
-                <span class="hint-after">修改后需重启 daemon 生效</span>
+                <span class="hint-after">修改后需重启程序生效</span>
               </div>
             </div>
             <div class="row">
@@ -360,6 +566,49 @@ function setConflict(p: ConflictPolicy) {
                 </label>
               </div>
             </div>
+
+            <div class="section-divider"></div>
+
+            <div class="row">
+              <div class="row-label">
+                <div class="row-title">系统集成</div>
+                <div class="row-desc">
+                  注册到 Windows 系统后可使用：<br />
+                  <small>• 右键文件菜单 "通过 QuickDrop 发送"</small><br />
+                  <small>• 通知按钮 (quickdrop:// 链接)</small>
+                </div>
+              </div>
+              <div class="row-control">
+                <div class="system-status">
+                  <span v-if="systemStatus?.installed" class="status-badge installed">已注册</span>
+                  <span v-else class="status-badge not-installed">未注册</span>
+                </div>
+              </div>
+            </div>
+            <div class="row" v-if="systemStatus">
+              <div class="row-label" />
+              <div class="row-control system-actions">
+                <button
+                  v-if="!systemStatus.installed"
+                  class="btn-action btn-primary"
+                  :disabled="systemBusy"
+                  @click="handleRegister"
+                >
+                  {{ systemBusy ? "注册中..." : "注册到系统" }}
+                </button>
+                <button
+                  v-else
+                  class="btn-action btn-danger"
+                  :disabled="systemBusy"
+                  @click="handleUnregister"
+                >
+                  {{ systemBusy ? "处理中..." : "取消注册" }}
+                </button>
+                <div v-if="systemMessage" :class="['system-msg', systemMessage.includes('失败') ? 'err' : 'ok']">
+                  {{ systemMessage }}
+                </div>
+              </div>
+            </div>
           </section>
 
           <!-- 关于 -->
@@ -374,8 +623,8 @@ function setConflict(p: ConflictPolicy) {
               <code class="about-val">{{ CONFIG_PATH }}</code>
             </div>
             <p class="about-text">
-              局域网点对点文件传输, 单二进制, 零依赖.<br />
-              所有配置实时落盘到上方路径, 可直接编辑 JSON 后重启 daemon.
+              局域网点对点文件传输，单二进制，零依赖<br />
+              所有配置实时保存到上方路径，可直接编辑 JSON 后重启程序。
             </p>
           </section>
         </template>
@@ -634,6 +883,9 @@ h2 {
 .row-control.wide {
   flex: 1 1 auto;
   max-width: 360px;
+  display: flex;
+  gap: var(--s-2);
+  align-items: center;
 }
 .row-control.radios {
   flex: 1 1 100%;
@@ -688,6 +940,23 @@ h2 {
   flex-basis: 100%;
   text-align: right;
   color: var(--c-warning);
+}
+
+/* 浏览按钮 */
+.btn-browse {
+  flex-shrink: 0;
+  padding: 7px 14px;
+  font-size: 13px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-sm);
+  background: var(--c-panel);
+  color: var(--c-text);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.btn-browse:hover {
+  background: var(--c-bg-mute);
+  border-color: var(--c-primary);
 }
 
 /* radio 卡 */
@@ -909,8 +1178,162 @@ h2 {
   .track::after {
     background: #f0f0f0;
   }
-  .btn.primary:hover:not(:disabled) {
-    background: #3a7eff;
-  }
+}
+
+/* 常用设置页样式 */
+.section-divider {
+  height: 1px;
+  background: var(--c-border);
+  margin: var(--s-5) 0;
+}
+
+.hint-block {
+  padding: var(--s-3);
+  background: var(--c-primary-soft);
+  border-radius: var(--r-sm);
+  color: var(--c-text-mute);
+  text-align: center;
+}
+
+/* 接收状态开关样式 */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 24px;
+}
+
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: #ccc;
+  transition: 0.3s;
+  border-radius: 24px;
+}
+
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  transition: 0.3s;
+  border-radius: 50%;
+}
+
+input:checked + .slider {
+  background-color: var(--c-primary);
+}
+
+input:checked + .slider:before {
+  transform: translateX(20px);
+}
+
+.status-text {
+  margin-left: var(--s-2);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.status-text.on {
+  color: var(--c-success);
+}
+
+.status-text.off {
+  color: var(--c-text-mute);
+}
+
+/* 系统集成 */
+.system-status {
+  display: flex;
+  align-items: center;
+}
+
+.status-badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.status-badge.installed {
+  background: var(--c-success-bg);
+  color: var(--c-success);
+}
+
+.status-badge.not-installed {
+  background: var(--c-warning-bg);
+  color: var(--c-warning);
+}
+
+.system-actions {
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--s-2);
+}
+
+.btn-action {
+  padding: 8px 20px;
+  font-size: 13px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: background 0.15s ease, opacity 0.15s ease;
+  border: 1px solid transparent;
+}
+
+.btn-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--c-primary);
+  color: #fff;
+  border-color: var(--c-primary);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #0052cc;
+  border-color: #0052cc;
+}
+
+.btn-danger {
+  background: transparent;
+  color: var(--c-danger);
+  border-color: var(--c-danger);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--c-danger-bg);
+}
+
+.system-msg {
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  max-width: 280px;
+}
+
+.system-msg.ok {
+  background: var(--c-success-bg);
+  color: var(--c-success);
+}
+
+.system-msg.err {
+  background: var(--c-danger-bg);
+  color: var(--c-danger);
 }
 </style>
